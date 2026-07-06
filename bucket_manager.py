@@ -671,7 +671,9 @@ class BucketManager:
             "activation_count": 0,
             # 记忆分级: 1=通用(所有通道可见), 2=私密(仅 admin-token 通道可见)。
             # 旧桶无此字段, 读取方用 meta.get("level", 1) 兜底 → 天然向后兼容。
-            "level": 2 if str(level) == "2" else 1,
+            # 2026-07-06 修正: 受限通道(URL-key, 即 claude.ai 侧)的写入一律钳到 1 ——
+            # 写入者必须永远能读回自己写的东西; 私密档只从全量通道(Kelivo/dashboard)写入。
+            "level": (2 if str(level) == "2" else 1) if ACCESS_LEVEL.get() >= 2 else 1,
         }
         # event_time 是用户/AI 设置的"事件实际发生时间",跟系统级 created 区分
         # 没传或非法就不写,读取时 dehydrator/前端会退回 created
