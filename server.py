@@ -45,7 +45,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
-from bucket_manager import BucketManager
+from bucket_manager import BucketManager, ACCESS_LEVEL
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
@@ -258,6 +258,7 @@ async def _merge_or_create(
     arousal: float,
     name: str = "",
     event_time: str = None,
+    level: int = 1,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -318,6 +319,7 @@ async def _merge_or_create(
         arousal=arousal,
         name=name or None,
         event_time=event_time,
+        level=level,
     )
     # --- Generate embedding for new bucket ---
     try:
@@ -676,8 +678,9 @@ async def hold(
     source_bucket: str = "",    valence: float = -1,
     arousal: float = -1,
     event_time: str = "",
+    level: int = 1,
 ) -> str:
-    """存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
+    """存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -708,6 +711,7 @@ async def hold(
             # 2026-06-10: feel 也接 event_time — 平时随手写 feel 当下即事发时间(不传=created, 行为不变),
             # 但批量回写历史(记忆写入工作台)时, 没有它 feel 的时间会全挤在写入批次那一刻
             event_time=event_time or None,
+            level=level,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -762,6 +766,7 @@ async def hold(
             bucket_type="permanent",
             pinned=True,
             event_time=event_time,
+            level=level,
         )
         try:
             await embedding_engine.generate_and_store(bucket_id, content)
@@ -779,6 +784,7 @@ async def hold(
         arousal=arousal,
         name=suggested_name,
         event_time=event_time or None,
+        level=level,
     )
 
     action = "合并→" if is_merged else "新建→"
@@ -2842,6 +2848,12 @@ async def api_bucket_create(request):
     if created_by not in ("user", "ai", "import"):
         created_by = "user"
 
+    # 记忆分级 (2026-07-06): body 可传 level=2 建私密桶, 其余一律 1
+    try:
+        req_level = 2 if int(body.get("level", 1)) == 2 else 1
+    except (TypeError, ValueError):
+        req_level = 1
+
     try:
         bucket_id = await bucket_mgr.create(
             content=content,
@@ -2857,6 +2869,7 @@ async def api_bucket_create(request):
             bucket_type=bucket_type,  # feel 切换时这里写入 metadata.type='feel'
             created_by=created_by,  # 默认 'user' (dashboard 手动新建); 程序化写入可传 'ai'
             summary=summary,
+            level=req_level,
         )
     except Exception as e:
         return JSONResponse({"error": f"create failed: {e}"}, status_code=500)
@@ -3924,6 +3937,9 @@ if __name__ == "__main__":
                 # 路径段方案 (b): 外层 McpUrlKeyPath 已用 compare_digest 校验过 /<key>/mcp
                 # 的密钥并剥成 /mcp + 打标 → 这里直接放行 (它只会给 /mcp 打标, 不碰 /api/*)。
                 if request.scope.get("_mcp_url_key_ok"):
+                    # URL-key 通道 = 受限视野: 只见 level-1 通用记忆
+                    # (streamable-http 下工具在本请求的 task 树内执行, contextvar 可达)
+                    ACCESS_LEVEL.set(1)
                     return await call_next(request)
                 sensitive = (
                     path.startswith("/api")
@@ -3941,6 +3957,7 @@ if __name__ == "__main__":
                     return await call_next(request)
                 provided = request.headers.get("X-Admin-Token", "")
                 if expected and provided and _hmac.compare_digest(provided, expected):
+                    ACCESS_LEVEL.set(2)  # admin-token 通道 = 全量视野
                     return await call_next(request)
                 # cookie 兜底: dashboard 工作台等页面用 Web Worker 拉数据, 这些请求不经
                 # 前端 fetch/XHR 的 header 注入(worker 读不到 localStorage), 但浏览器会自动
@@ -3948,6 +3965,7 @@ if __name__ == "__main__":
                 # cookie 走 SameSite=Strict + CORS 已收紧到同源 → CSRF 风险可控。header 仍是首选。
                 _cookie_tok = request.cookies.get("ombre_admin_token", "")
                 if expected and _cookie_tok and _hmac.compare_digest(_cookie_tok, expected):
+                    ACCESS_LEVEL.set(2)  # dashboard cookie 通道 = 全量视野
                     return await call_next(request)
                 # --- /mcp URL-key 旁路 (opt-in, 仅 /mcp 这一条口子) ---
                 # claude.ai 网页连接器只有 URL 字段、配不了自定义 header → 给 /mcp 开一条
@@ -3969,6 +3987,7 @@ if __name__ == "__main__":
                         and url_key_provided
                         and _hmac.compare_digest(url_key_provided, url_key_expected)
                     ):
+                        ACCESS_LEVEL.set(1)  # URL-key(query 形态) = 受限视野
                         return await call_next(request)
                 return _AuthJSONResponse(
                     {"error": "unauthorized — missing or invalid X-Admin-Token"},

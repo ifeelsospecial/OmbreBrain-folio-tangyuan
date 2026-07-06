@@ -38,6 +38,23 @@ from pathlib import Path
 from typing import Optional
 
 import frontmatter
+import contextvars
+
+# ============================================================
+# 记忆分级访问控制 / Memory level access control
+# 2 = 全量视野(默认: dashboard /api/*, admin-token 通道, 后台任务)
+# 1 = 受限视野(claude.ai 的 URL-key 通道) → 只见 level<=1 的桶
+# server.py 的鉴权中间件按进门方式 set 这个值。
+# ============================================================
+ACCESS_LEVEL = contextvars.ContextVar("ombre_access_level", default=2)
+
+
+def _level_visible(meta: dict) -> bool:
+    """桶对当前访问级别是否可见。旧桶无 level 字段 → 默认 1(通用)。"""
+    try:
+        return int(meta.get("level", 1)) <= ACCESS_LEVEL.get()
+    except (TypeError, ValueError):
+        return True  # 字段被写坏时宁可放行 level-1 语义, 不炸整个读取
 import jieba
 from rapidfuzz import fuzz
 
@@ -611,6 +628,7 @@ class BucketManager:
         event_time: str = None,
         created_by: str = None,
         summary: str = None,
+        level: int = 1,
     ) -> str:
         """
         Create a new memory bucket, return bucket ID.
@@ -651,6 +669,9 @@ class BucketManager:
             # 初值 0 对齐上游: "创建" ≠ "被召回"。touch() 首次命中后才 +1。
             # 让 breath 冷启动检测(activation_count==0 且 importance>=8)能认出新建的重要桶。
             "activation_count": 0,
+            # 记忆分级: 1=通用(所有通道可见), 2=私密(仅 admin-token 通道可见)。
+            # 旧桶无此字段, 读取方用 meta.get("level", 1) 兜底 → 天然向后兼容。
+            "level": 2 if str(level) == "2" else 1,
         }
         # event_time 是用户/AI 设置的"事件实际发生时间",跟系统级 created 区分
         # 没传或非法就不写,读取时 dehydrator/前端会退回 created
@@ -730,7 +751,11 @@ class BucketManager:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return None
-        return self._load_bucket(file_path)
+        bucket = self._load_bucket(file_path)
+        # 分级滤网: 受限通道按号索取 level-2 桶 → 视同不存在(连"存在但无权"都不暴露)
+        if bucket and not _level_visible(bucket.get("metadata", {})):
+            return None
+        return bucket
 
     # ---------------------------------------------------------
     # Move bucket between directories
@@ -1630,6 +1655,10 @@ class BucketManager:
                     bucket = self._load_bucket(file_path)
                     if bucket:
                         buckets.append(bucket)
+
+        # 分级滤网: 受限通道(ACCESS_LEVEL=1)看不见 level-2 私密桶
+        if ACCESS_LEVEL.get() < 2:
+            buckets = [b for b in buckets if _level_visible(b.get("metadata", {}))]
 
         return buckets
 
