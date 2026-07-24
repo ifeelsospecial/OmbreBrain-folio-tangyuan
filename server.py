@@ -243,6 +243,228 @@ async def dream_hook(request):
         return PlainTextResponse("")
 
 
+# ============================================================
+# Ombre AutoBrain — server.py 补丁
+#
+# 贴到 server.py 里 /dream-hook 那个 endpoint 的正下方即可（约第 240 行之后）。
+# 不改任何已有代码，只新增两个 endpoint。
+#
+#   GET  /recall-hook?q=...   听到就搜  —— 把她这句话拿去检索，返回纯文本
+#   POST /capture-hook        遇到就记  —— 把一段对话丢进来，自动拆桶存下
+#
+# 依赖的东西 server.py 里全都已经有了：
+#   bucket_mgr / dehydrator / decay_engine / strip_wikilinks /
+#   count_tokens_approx / is_highlighted / is_protected / is_internalized / grow
+# ============================================================
+
+import re
+
+
+# --- 停用词：这些词满天飞，拿去检索只会捞回一堆噪声 ---
+_STOP = set("""
+的 了 吗 呢 吧 啊 呀 哦 嗯 是 我 你 他 她 它 们 这 那 有 在 和 就 都 也 还
+不 没 很 太 要 会 能 说 对 好 一个 什么 怎么 为什么 可以 但是 因为 所以 现在
+就是 一下 一点 觉得 感觉 知道 时候 一样 这样 那样 而且 然后 如果 已经
+""".split())
+
+
+# 虚字。这些字本身没有检索价值，但更有用的是：
+# 它们是词的天然边界。中文不用分词器也能切 —— 按虚字劈开，剩下的就是实词。
+# 滑窗（4/3/2 字）切出来的大多是跨词边界的碎片（"天去柏林"），
+# 长词优先反而会把真正该检索的"柏林"挤掉。虚字切分没这个毛病。
+_FUNC_CHARS = ("的了吗呢吧啊呀哦嗯是我你他她它们这那有在和就都也还不没很太要会"
+               "能说对好个上下去来把被让给但而或于从到又再只才更最已经过着之为"
+               "很挺蛮些每各并且则却又啦嘛哈呗咯")
+
+_SPLIT_RE = re.compile(r"[" + _FUNC_CHARS + r"\s\d\W_]+", re.UNICODE)
+
+
+def _extract_keywords(text: str, top_k: int = 8) -> list[str]:
+    """
+    从她说的话里抠出值得检索的词。
+
+    英文/数字整词单独抽（专有名词命中率最高，排最前）。
+    中文按虚字+标点劈开，留下长度 >= 2 的实词片段。
+    片段过长（>6 字，说明中间没虚字，多半是连写的复合概念）再滑窗补几个短的。
+
+    宁可多给两个词让 fuzz 去筛，也不要一个词都给不出来。
+    """
+    if not text:
+        return []
+    text = re.sub(r"https?://\S+", " ", text)  # 链接没有检索价值
+
+    latin, cjk, seen = [], [], set()
+
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,}", text):
+        if w.lower() not in seen:
+            seen.add(w.lower())
+            latin.append(w)
+
+    for frag in _SPLIT_RE.split(text):
+        frag = frag.strip()
+        if len(frag) < 2 or frag in _STOP:
+            continue
+        if frag not in seen:
+            seen.add(frag)
+            cjk.append(frag)
+        # 长片段额外补几个 3 字窗，提高召回
+        if len(frag) > 6:
+            for i in range(0, len(frag) - 2, 2):
+                g = frag[i:i + 3]
+                if g not in seen and g not in _STOP:
+                    seen.add(g)
+                    cjk.append(g)
+
+    out = (latin + cjk)[:top_k]
+
+    # 兜底：短句常常一个实词都劈不出来（"我好累" 里 "好" 是虚字、"累" 是单字）。
+    # 但这种句子恰恰是最该被想起来点什么的时候。直接拿原句去 fuzz。
+    if not out:
+        bare = re.sub(r"[\s\W_]+", "", text)[:20]
+        if len(bare) >= 2:
+            out = [bare]
+
+    return out
+
+
+@mcp.custom_route("/recall-hook", methods=["GET"])
+async def recall_hook(request):
+    """
+    听到就搜。
+
+    GET /recall-hook?q=她刚说的那句话&limit=4&budget=1200
+
+    传整句话进来，这边负责抠关键词、多词检索、合并去重、脱水成纯文本。
+    没命中就返回空串 —— 空串代表"这句话没勾起什么"，调用方直接不注入。
+
+    刻意做的几件事：
+      - exclude_pinned：钉选的记忆开窗时 breath-hook 已经浮现过了，
+        这里再命中就是同一条说两遍，是噪声
+      - 排除 feel：feel 是私密沉淀，设计上不参与自动检索
+      - budget 默认给得很小：这是每轮都要注入的东西，不能撑爆上下文
+    """
+    from starlette.responses import PlainTextResponse
+
+    q = (request.query_params.get("q") or "").strip()
+    if not q:
+        return PlainTextResponse("")
+
+    try:
+        limit = int(request.query_params.get("limit", "4"))
+    except ValueError:
+        limit = 4
+    try:
+        budget = int(request.query_params.get("budget", "1200"))
+    except ValueError:
+        budget = 1200
+
+    try:
+        await decay_engine.ensure_started()
+
+        keywords = _extract_keywords(q)
+        if not keywords:
+            return PlainTextResponse("")
+
+        # 多词分别检索，按命中次数聚合 —— 被多个关键词同时命中的桶最相关
+        pool: dict = {}
+        for kw in keywords:
+            try:
+                hits = await bucket_mgr.search(kw, limit=limit * 2, record_stats=False)
+            except Exception:
+                continue
+            for b in hits:
+                meta = b.get("metadata", {})
+                # 噪声桶（软删除态）
+                if meta.get("resolved") and meta.get("importance", 5) == 1:
+                    continue
+                # feel 不参与自动检索
+                if meta.get("type") == "feel":
+                    continue
+                # 钉选的已经在 breath-hook 里浮现过了，别重复
+                if is_highlighted(meta) or is_protected(meta):
+                    continue
+                if is_internalized(meta):
+                    continue
+                bid = b["id"]
+                if bid in pool:
+                    pool[bid]["_n"] += 1
+                else:
+                    b["_n"] = 1
+                    pool[bid] = b
+
+        if not pool:
+            return PlainTextResponse("")
+
+        ranked = sorted(
+            pool.values(),
+            key=lambda b: (b["_n"], b.get("score", 0)),
+            reverse=True,
+        )[:limit]
+
+        parts, hit_ids = [], []
+        for b in ranked:
+            meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
+            try:
+                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), meta)
+            except Exception:
+                summary = strip_wikilinks(b.get("content", ""))[:300]
+            cost = count_tokens_approx(summary)
+            if cost > budget:
+                break
+            parts.append(summary)
+            hit_ids.append(b["id"])
+            budget -= cost
+
+        if not parts:
+            return PlainTextResponse("")
+
+        # 记命中 —— 被自动检索捞上来也是"被想起"，该给权重
+        try:
+            bucket_mgr.record_surfacing(hit_ids)
+        except Exception:
+            pass
+
+        header = "[Ombre Brain - 她这句话让我想起来的]"
+        return PlainTextResponse(header + "\n" + "\n---\n".join(parts))
+
+    except Exception as e:
+        logger.warning(f"Recall hook failed: {e}")
+        return PlainTextResponse("")  # 永远不要因为记忆挂了就把对话搞崩
+
+
+@mcp.custom_route("/capture-hook", methods=["POST"])
+async def capture_hook(request):
+    """
+    遇到就记。
+
+    POST /capture-hook
+      {"content": "这一段对话里发生的事...", "event_time": "2026-07-24"}
+
+    走 grow 的完整逻辑（自动拆桶、打标、合并）。
+    调用方负责攒够量再打过来，别每句话都打一次 —— grow 要过 LLM，贵。
+    """
+    from starlette.responses import JSONResponse
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+
+    content = (body.get("content") or "").strip()
+    if len(content) < 20:
+        return JSONResponse({"ok": True, "skipped": "too short"})
+
+    event_time = body.get("event_time") or ""
+
+    try:
+        result = await grow(content, event_time=event_time)
+        _invalidate_buckets_cache()
+        return JSONResponse({"ok": True, "result": result})
+    except Exception as e:
+        logger.warning(f"Capture hook failed: {e}")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 # =============================================================
 # Internal helper: merge-or-create
 # 内部辅助：检查是否可合并，可以则合并，否则新建
@@ -347,7 +569,8 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
+    """    每次对话第一件事，无参数调用一次。她每条超过15字的消息，回话前无条件带 query 再调一次，不判断值不值得查。
+检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -680,7 +903,8 @@ async def hold(
     event_time: str = "",
     level: int = 1,
 ) -> str:
-    """存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
+    """    她说了她的位置、她做的事、她的情绪、她遇到的人——先存再回话，不判断够不够格。
+存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
