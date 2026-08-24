@@ -2146,7 +2146,7 @@ async def api_bucket_update(request):
     # 透传到 bucket_mgr.update — 它内部已处理 protected/highlight 拆分、
     # internalized/digested 兼容、event_time 校验、pinned 别名等
     allowed = {
-        "name", "domain", "tags", "valence", "arousal", "importance",
+        "name", "domain", "tags", "valence", "arousal", "importance", "level",
         "resolved", "protected", "highlight", "pinned",
         "internalized", "digested", "event_time", "content", "model_valence",
         "type",  # 支持 feel ↔ dynamic 切换(导入工作台 feel 开关)

@@ -42,11 +42,12 @@ import contextvars
 
 # ============================================================
 # 记忆分级访问控制 / Memory level access control
-# 2 = 全量视野(默认: dashboard /api/*, admin-token 通道, 后台任务)
+# 2 = 全量视野(dashboard /api/*, admin-token 通道, 显式授权的后台任务)
 # 1 = 受限视野(claude.ai 的 URL-key 通道) → 只见 level<=1 的桶
 # server.py 的鉴权中间件按进门方式 set 这个值。
+# 默认必须是 1：如果请求上下文在异步任务间丢失，也不能意外变成全量视野。
 # ============================================================
-ACCESS_LEVEL = contextvars.ContextVar("ombre_access_level", default=2)
+ACCESS_LEVEL = contextvars.ContextVar("ombre_access_level", default=1)
 
 
 def _level_visible(meta: dict) -> bool:
@@ -54,7 +55,8 @@ def _level_visible(meta: dict) -> bool:
     try:
         return int(meta.get("level", 1)) <= ACCESS_LEVEL.get()
     except (TypeError, ValueError):
-        return True  # 字段被写坏时宁可放行 level-1 语义, 不炸整个读取
+        # 权限字段损坏时必须收紧，而不是把私密记忆意外放出去。
+        return ACCESS_LEVEL.get() >= 2
 import jieba
 from rapidfuzz import fuzz
 
@@ -862,6 +864,13 @@ class BucketManager:
             post["arousal"] = max(0.0, min(1.0, float(kwargs["arousal"])))
         if "name" in kwargs:
             post["name"] = sanitize_name(kwargs["name"])
+        if "level" in kwargs:
+            # 只有两个明确等级：1=受限渠道可见，2=仅完整接口可见。
+            # 非法值一律收紧到 2，避免编辑或旧数据异常造成意外暴露。
+            try:
+                post["level"] = 1 if int(kwargs["level"]) == 1 else 2
+            except (TypeError, ValueError):
+                post["level"] = 2
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
             # 取消噪声: 若调用方没显式改 importance, 则从 importance_before_noise 恢复
