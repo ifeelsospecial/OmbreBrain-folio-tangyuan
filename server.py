@@ -574,8 +574,7 @@ async def breath(
     arousal: float = -1,
     max_results: int = 20,
 ) -> str:
-    """    每次对话第一件事，无参数调用一次。她每条超过15字的消息，回话前无条件带 query 再调一次，不判断值不值得查。
-检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。"""
+    """每次对话第一件事，无参数调用一次：睁眼看看自己记得什么，浮现权重最高的未解决记忆。0 参数是刻意设计——claude.ai 按需加载工具时会跳过参数复杂的工具。要按关键词找记忆用 breath_search(query=...)；读 feel、情绪坐标检索、自定义 token 预算用 breath_advanced(...)。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     max_tokens = min(max_tokens, 20000)
@@ -921,6 +920,54 @@ async def breath(
 
     return "\n---\n".join(results)
 
+
+
+# 对外公布的 schema 保持 0 参数(让 claude.ai 稳定自动加载浮现工具), 但函数本身保留旧签名:
+# 缓存了旧工具定义的客户端升级后仍可能发 query/domain 等参数。FastMCP 默认会把 0 参数
+# 函数收到的未知字段静默丢弃 → 定向检索悄悄降级成默认浮现。这里改成: 旧参数照常生效,
+# 拼错/未知参数直接报错。(对齐上游 3.6.x server.py 的 breath 兼容适配)
+try:
+    _breath_public_tool = mcp._tool_manager.get_tool("breath")
+    if _breath_public_tool is None:
+        raise RuntimeError("registered breath tool is missing")
+    _breath_arg_model = _breath_public_tool.fn_metadata.arg_model
+    _breath_arg_model.model_config["extra"] = "forbid"
+    _breath_arg_model.model_rebuild(force=True)
+    _breath_public_tool.parameters = {
+        "properties": {},
+        "title": "breathArguments",
+        "type": "object",
+    }
+except (AttributeError, RuntimeError, TypeError, ValueError) as _breath_compat_exc:
+    logger.warning("breath legacy-argument compatibility adapter unavailable: %s", _breath_compat_exc)
+
+
+@mcp.tool()
+async def breath_search(query: str, domain: str = "", max_results: int = 20) -> str:
+    """她每条超过15字的消息，回话前无条件带 query 调一次，不判断值不值得查。按关键词检索记忆，query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。读 feel、情绪坐标、token 预算用 breath_advanced。"""
+    if not query or not query.strip():
+        return "breath_search 需要 query。无参数浮现请用 breath()。"
+    return await breath(query=query, domain=domain, max_results=max_results)
+
+
+@mcp.tool()
+async def breath_advanced(
+    query: str = "",
+    max_tokens: int = 10000,
+    domain: str = "",
+    valence: float = -1,
+    arousal: float = -1,
+    max_results: int = 20,
+) -> str:
+    """高级记忆读取。domain="feel" 读你之前留下的 feel(按时间倒序)；valence/arousal 0~1 传情感坐标做情绪共鸣检索(-1 忽略)；max_tokens 控制返回总 token 上限(默认10000,最大20000)；max_results 返回数量上限(默认20,最大50)；domain 逗号分隔。不传 query 为浮现模式，传 query 为关键词检索。"""
+    return await breath(
+        query=query,
+        max_tokens=max_tokens,
+        domain=domain,
+        valence=valence,
+        arousal=arousal,
+        max_results=max_results,
+    )
 
 # =============================================================
 # Tool 2: hold — Hold on to this

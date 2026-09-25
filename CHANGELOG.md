@@ -2,6 +2,15 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-09-25 · breath 拆分（对齐上游 2.6.x / folio 2026-07-15）
+
+- `breath` 对外公布为 0 参数（claude.ai 按需加载工具时能稳定选中），新增 `breath_search(query, domain, max_results)` 与 `breath_advanced(query, max_tokens, domain, valence, arousal, max_results)`。
+- 兼容：`breath` 函数保留旧签名，缓存了旧 schema 的客户端继续传 `query`/`domain` 照常生效；拼错或未知参数直接报错，不再被 FastMCP 静默丢弃降级为默认浮现（做法同上游 3.6.x，未采用 folio 的 `breath_legacy` 别名）。
+- 未移植 folio 的 `catalog` 目录模式（本 fork 无此功能）。
+- 私密分级不变：三个入口共用同一实现，读桶仍经 `list_all`/`get` 分级过滤；`/breath-hook`、`/recall-hook`、`/capture-hook` 不经过这些工具，不受影响。
+- CLAUDE_PROMPT.md 采用 folio 新版工具说明（去掉 catalog），保留 `source`；README / USAGE 同步。
+- 新增 `tests/test_breath_split.py`（6 例，走真实 MCP 调用路径）；已验证去掉兼容适配时其中 2 例失败。
+
 ## 2026-07-10 · 上游对齐批次一（v2.3.19 → v2.5.3 修复类）
 
 从上游两条版本线（v2.4.x / v2.5.x）移植的修复与健壮性改动。功能类（OAuth、multi-owner、目录模式等）不在本批，另行评估。
