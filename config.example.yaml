@@ -106,6 +106,15 @@ limits:
 
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
+# --- 桶间关系 / Relations ---
+# 新建记忆时按向量相似度自动连关系的门槛。本 fork 默认比上游(0.72/0.75/0.85)整体高 0.08:
+# 语料越集中在同一个人、同一段生活, 相似度整体越高, 上游门槛会让大部分记忆撞满每桶 8 条上限。
+# 改了之后用 workflow「补建存量记忆的桶间关系」勾选 rebuild 重建一次。
+relations:
+  related_min_score: 0.80        # 相关
+  continuation_min_score: 0.83   # 前段 / 后续(72 小时内)
+  same_event_min_score: 0.93     # 同一事件(6 小时内)
+
 # --- 浮现 / Surfacing ---
 # breath() 浮现区给近期新建的记忆预留位置(对齐上游 3.6.0)。按缺口补: 权重排序
 # 自己已经带进来几条近期记忆, 就少补几条。recent_slots=0 关闭。
