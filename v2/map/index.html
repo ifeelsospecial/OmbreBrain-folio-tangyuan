@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.compiled.js"></script>
+<title>足迹地图</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="stylesheet" href="./vendor/leaflet.min.css" />
+<style>
+  :root {
+    --bg: #f4f3f7; --paper: #ffffff; --ink: #1a1922; --ink-3: #6d6a7c; --ink-4: #a6a3b3;
+    --accent: #6e4f9a; --rose: #d291b3; --line: rgba(26, 25, 34, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1a1820; --paper: #23212b; --ink: #ebe9ee; --ink-3: #9c98a8; --ink-4: #6d6a7c;
+      --accent: #b39ad8; --rose: #d291b3; --line: rgba(235, 233, 238, 0.1);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink); display: flex; flex-direction: column;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+  header { padding: 14px 16px 10px; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0; }
+  .sum { color: var(--ink-3); font-size: 13.5px; }
+  .sum b { color: var(--accent); }
+  .wrap { flex: 1; display: flex; min-height: 0; }
+  #map { flex: 1; min-height: 320px; background: var(--bg); }
+  aside {
+    width: 340px; max-width: 42vw; overflow-y: auto; border-left: 1px solid var(--line);
+    background: var(--paper); padding: 14px 16px 24px;
+  }
+  .cities { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .chip {
+    font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--line); background: transparent; color: var(--ink);
+  }
+  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .city-hd { font-weight: 600; font-size: 17px; margin: 4px 0 2px; }
+  .city-sub { color: var(--ink-3); font-size: 12.5px; margin-bottom: 10px; }
+  .mem { padding: 9px 0; border-top: 1px solid var(--line); }
+  .mem-day { color: var(--ink-3); font-size: 12px; }
+  .mem-name { word-break: break-word; }
+  .mem-spot { color: var(--accent); font-size: 12.5px; }
+  .hint, .error { color: var(--ink-3); padding: 12px 0; }
+  .error { color: var(--rose); }
+  .leaflet-container { font: inherit; }
+  .tiles-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
+  .leaflet-control-attribution { font-size: 10.5px; }
+  @media (max-width: 720px) {
+    .wrap { flex-direction: column; }
+    #map { flex: none; height: 55vh; }
+    aside { width: auto; max-width: none; border-left: 0; border-top: 1px solid var(--line); flex: 1; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>足迹地图</h1>
+  <span class="sum" id="sum">正在读取…</span>
+</header>
+<div class="wrap">
+  <div id="map" role="region" aria-label="足迹地图"></div>
+  <aside id="side" aria-live="polite">
+    <div class="cities" id="cities"></div>
+    <div id="detail"><p class="hint">点地图上的圆点或上面的城市，看在那里留下的记忆。</p></div>
+  </aside>
+</div>
+<script src="./vendor/leaflet.min.js"></script>
+<script>
+(function () {
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const dark = () => window.matchMedia('(prefers-color-scheme: dark)').matches && document.documentElement.dataset.theme !== 'light';
+
+  const map = L.map('map', { worldCopyJump: true, zoomControl: true }).setView([51.5, 0], 4);
+  // OpenStreetMap 公共底图(无需密钥); 深色模式用滤镜把底图压暗, 不另换一套瓦片
+  if (dark()) document.getElementById('map').classList.add('tiles-dark');
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+  }).addTo(map);
+
+  const markers = new Map();
+  let active = null;
+
+  function radius(n) { return Math.min(22, 6 + Math.sqrt(n) * 4); }
+
+  function select(key, fly) {
+    const g = markers.get(key);
+    if (!g) return;
+    if (active) markers.get(active).circle.setStyle({ weight: 1.5, fillOpacity: 0.55 });
+    active = key;
+    g.circle.setStyle({ weight: 3, fillOpacity: 0.85 });
+    if (fly) map.flyTo([g.data.lat, g.data.lon], Math.max(map.getZoom(), 9), { duration: 0.8 });
+    document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c.dataset.key === key));
+    const d = g.data;
+    const span = d.first && d.last && d.first !== d.last ? `${d.first} → ${d.last}` : (d.last || '');
+    document.getElementById('detail').innerHTML = `
+      <div class="city-hd">${esc(d.city)}</div>
+      <div class="city-sub">${esc(d.country)}${d.country ? ' · ' : ''}${d.count} 条记忆${span ? ' · ' + esc(span) : ''}</div>
+      ${d.memories.map(m => `
+        <div class="mem">
+          <div class="mem-day">${esc(m.day)}</div>
+          <div class="mem-name">${esc(m.name)}</div>
+          ${m.spot ? `<div class="mem-spot">${esc(m.spot)}</div>` : ''}
+        </div>`).join('')}`;
+  }
+
+  async function load() {
+    try {
+      const r = await fetch('/api/places');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      const places = data.places || [];
+      const sum = document.getElementById('sum');
+      if (!places.length) {
+        sum.textContent = '还没有认出地点。';
+        document.getElementById('detail').innerHTML =
+          '<p class="hint">新存的出行记忆会自动认出地点；旧记忆需要跑一次「给存量记忆认地点」。</p>';
+        return;
+      }
+      const countries = new Set(places.map(p => p.country).filter(Boolean));
+      sum.innerHTML = `<b>${places.length}</b> 个地方 · <b>${countries.size}</b> 个国家 · <b>${data.memories_with_places}</b> 条记忆`;
+      const accent = css('--accent') || '#6e4f9a';
+      const bounds = [];
+      const chips = document.getElementById('cities');
+      places.forEach((p, i) => {
+        const key = String(i);
+        const circle = L.circleMarker([p.lat, p.lon], {
+          radius: radius(p.count), color: accent, weight: 1.5, fillColor: accent, fillOpacity: 0.55,
+        }).addTo(map);
+        circle.bindTooltip(`${esc(p.city)} · ${p.count}`, { direction: 'top' });
+        circle.on('click', () => select(key, false));
+        markers.set(key, { circle, data: p });
+        bounds.push([p.lat, p.lon]);
+        const chip = document.createElement('button');
+        chip.className = 'chip';
+        chip.dataset.key = key;
+        chip.textContent = `${p.city} ${p.count}`;
+        chip.addEventListener('click', () => select(key, true));
+        chips.appendChild(chip);
+      });
+      if (bounds.length > 1) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 7 });
+      else map.setView(bounds[0], 9);
+    } catch (e) {
+      document.getElementById('sum').textContent = '';
+      document.getElementById('detail').innerHTML = `<p class="error">没能读到足迹（${esc(e.message)}）。刷新一下试试。</p>`;
+    }
+  }
+  load();
+})();
+</script>
+</body>
+</html>

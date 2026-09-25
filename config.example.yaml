@@ -121,6 +121,11 @@ relations:
 surfacing:
   recent_slots: 3   # 预留几个位置
   recent_days: 7    # "近期" = 最近几天内创建
+  on_this_day: true # 开场附带「一年前 / 一个月前的今天」各一条
+
+# --- 足迹地图 / Places ---
+places:
+  auto_extract: true  # 新存的出行类记忆在后台认地点(每条一次小的 AI 调用)
 
 scoring_weights:
   topic_relevance: 4.0

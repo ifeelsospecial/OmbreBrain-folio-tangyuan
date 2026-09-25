@@ -408,6 +408,27 @@ async def breath_hook(request):
         except Exception:
             pass
 
+        # 快到的约定放最前(最该先想起), 一个月/一年前的今天放最后; 都不进权重池
+        try:
+            for due, delta, pb in reversed(_upcoming_plans(all_buckets)):
+                parts.insert(0, f"📅 约好的事 · {due.isoformat()}（{_due_phrase(delta)}）：{strip_wikilinks(pb.get('content', ''))}")
+            for title, db in _on_this_day(all_buckets, exclude_ids=set(surfaced_ids)):
+                try:
+                    day_summary = await dehydrator.dehydrate(
+                        strip_wikilinks(db["content"]), {k: v for k, v in db["metadata"].items() if k != "tags"})
+                except Exception:
+                    day_summary = strip_wikilinks(db.get("content", ""))[:300]
+                parts.append(f"🕰 {title}：{day_summary}")
+            # 周日提醒一次: 有攒下的旧事等她确认放不放下(每周回顾页 /v2/review/)
+            from datetime import datetime as _dt
+            if _dt.utcnow().weekday() == 6:
+                n_review = len(_review_candidates(all_buckets, limit=100000))
+                if n_review >= 5:
+                    parts.append(f"🗂 这周攒了 {n_review} 条可能已经过去的旧事。合适的时候可以提醒她去「每周回顾」"
+                                 f"（dashboard 的 /v2/review/）看看，哪些放下、哪些留着。")
+        except Exception as e:
+            logger.warning(f"breath-hook extra sections failed: {e}")
+
         if not parts:
             return PlainTextResponse("")
         return PlainTextResponse("[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts))
@@ -671,7 +692,8 @@ async def capture_hook(request):
     event_time = body.get("event_time") or ""
 
     try:
-        result = await grow(content, event_time=event_time)
+        # 把这一段对话原文一起交给 grow: 拆出来的每条记忆都挂上 raw_source, source 工具才有原话可查
+        result = await _grow_impl(content, event_time=event_time, raw_source=content)
         _invalidate_buckets_cache()
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
@@ -739,6 +761,7 @@ async def _merge_or_create(
     test_data: bool = False,
     quotes: list | None = None,
     notes: list | None = None,
+    raw_source: str = "",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -806,6 +829,8 @@ async def _merge_or_create(
                         notes.append(f"合并进的记忆已有 {len(have)} 条引语，上限 {MAX_QUOTES}，"
                                      f"本次有 {overflow} 条没存；想换掉旧的用 trace(quotes_replace=...)")
                     update_kwargs["quotes_append"] = quotes
+                if raw_source and raw_source.strip():
+                    update_kwargs["raw_source"] = _append_raw_source(bucket["metadata"].get("raw_source"), raw_source)
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
@@ -830,9 +855,47 @@ async def _merge_or_create(
     )
     if quotes:
         await bucket_mgr.update(bucket_id, quotes=quotes)
+    if raw_source and raw_source.strip():
+        await bucket_mgr.update(bucket_id, raw_source=_append_raw_source("", raw_source))
     if not test_data:
         _schedule_relation_link(bucket_id, content)
+        _schedule_place_extraction(bucket_id, content, domain)
     return bucket_id, False
+
+
+_RAW_SOURCE_CAP = 8000  # 与 BucketManager.update 的 raw_source 截断上限一致
+
+
+def _append_raw_source(existing, new: str) -> str:
+    """合并进已有记忆时原文追加不覆盖; 超出上限保留最近的部分(最新的对话最可能被核对), 并标明前面有省略。"""
+    new = str(new or "").strip()
+    old = str(existing or "").strip()
+    if not old:
+        combined = new
+    elif new in old:
+        combined = old
+    else:
+        combined = f"{old}\n\n———\n\n{new}"
+    if len(combined) > _RAW_SOURCE_CAP:
+        marker = "（更早的原文已省略）\n"
+        combined = marker + combined[-(_RAW_SOURCE_CAP - len(marker)):]
+    return combined
+
+
+def _schedule_place_extraction(bucket_id: str, content: str, domain, bucket_type: str = "dynamic") -> None:
+    """新建桶后后台认地点(足迹地图)。只对出行领域/带去向字眼的记忆调 AI; 失败只记日志。"""
+    try:
+        from places import should_extract, attach_places
+        if not coerce_bool(((config.get("places") or {}) if isinstance(config, dict) else {}).get("auto_extract", True),
+                           default=True):
+            return
+        if not should_extract({"type": bucket_type, "domain": list(domain or [])}, content):
+            return
+        task = asyncio.create_task(attach_places(bucket_mgr, dehydrator, bucket_id, content))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    except Exception as e:
+        logger.warning(f"schedule place extraction failed / 地点识别未能排队: {e}")
 
 
 def _schedule_relation_link(bucket_id: str, content: str) -> None:
@@ -853,6 +916,156 @@ def _schedule_relation_link(bucket_id: str, content: str) -> None:
 # 读不出时间的桶在给了范围时【排除】而非放行: 调用方明说"只要这段时间的", 静默多给等于破坏约定。
 # 核心准则/永久参考不受时间过滤: 它们是准则, 不是那段时间里发生的事(有意的不对称)。
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# 开场浮现的两个小段(本 fork 定制): 「一个月 / 一年前的今天」与「快到的约定」
+# 都是在权重池之外追加的独立段, 不进权重打分, 也不占普通浮现的名额。
+# ---------------------------------------------------------------
+_ON_THIS_DAY_EXCLUDED = ("feel", "plan", "letter", "i", "trashed", "archived")
+
+
+def _bucket_day(meta: dict):
+    """事件日优先(event_time), 没有才用创建日。返回 date 或 None。"""
+    from utils import parse_iso_datetime as _parse
+    for key in ("event_time", "created"):
+        raw = (meta or {}).get(key)
+        if raw:
+            try:
+                return _parse(raw).date()
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _shift_months(day, months: int):
+    """同一天往前挪 N 个月; 目标月没有这一天(31 号)时取该月最后一天。"""
+    import calendar
+    from datetime import date as _date
+    total = day.year * 12 + (day.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    return _date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _on_this_day(all_buckets: list, today=None, exclude_ids: set | None = None) -> list:
+    """返回 [(标题, 桶)], 最多一年前、一个月前各一条; 同一天多条时挑重要度×情绪强度最高的。"""
+    from datetime import datetime as _dt
+    surf = (config.get("surfacing") or {}) if isinstance(config, dict) else {}
+    if not coerce_bool(surf.get("on_this_day", True), default=True):
+        return []
+    today = today or _dt.utcnow().date()
+    exclude_ids = exclude_ids or set()
+    picks = []
+    for months, title in ((12, "一年前的今天"), (1, "一个月前的今天")):
+        target = _shift_months(today, months)
+        same_day = []
+        for b in all_buckets:
+            meta = b.get("metadata") or {}
+            if (meta.get("type") in _ON_THIS_DAY_EXCLUDED or b["id"] in exclude_ids
+                    or is_internalized(meta) or meta.get("dont_surface") or _is_noise_meta(meta)):
+                continue
+            if _bucket_day(meta) == target:
+                same_day.append(b)
+        if same_day:
+            def _weight(b):
+                m = b.get("metadata") or {}
+                try:
+                    return int(m.get("importance") or 5) * (0.5 + float(m.get("arousal") or 0.3))
+                except (TypeError, ValueError):
+                    return 0
+            best = max(same_day, key=_weight)
+            picks.append((f"{title}（{target.isoformat()}）", best))
+            exclude_ids = exclude_ids | {best["id"]}
+    return picks
+
+
+def _upcoming_plans(all_buckets: list, today=None, ahead_days: int = 3, overdue_days: int = 7) -> list:
+    """进行中且带约定日期的 plan: 未来 ahead_days 天内到期, 或已过期但不超过 overdue_days 天。按日期排序。"""
+    from datetime import datetime as _dt, date as _date
+    today = today or _dt.utcnow().date()
+    rows = []
+    for b in all_buckets:
+        meta = b.get("metadata") or {}
+        if meta.get("type") != "plan" or str(meta.get("status") or "active").lower() != "active":
+            continue
+        try:
+            due = _date.fromisoformat(str(meta.get("due") or "")[:10])
+        except ValueError:
+            continue
+        delta = (due - today).days
+        if -overdue_days <= delta <= ahead_days:
+            rows.append((due, delta, b))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _due_phrase(delta: int) -> str:
+    if delta == 0:
+        return "就是今天"
+    if delta == 1:
+        return "明天"
+    if delta > 1:
+        return f"{delta} 天后"
+    return f"已经过了 {-delta} 天，还没做"
+
+
+# ---------------------------------------------------------------
+# 每周回顾(本 fork 定制): 列出"可能已经过去的事", 由她一键放下或保留。
+# 578 条动态记忆里只有 3 条被放下过——dream 里的"放下"几乎没发生, 浮现池一直是同一批旧事。
+# 不替她自动放下: 这是她的事, 系统只负责把候选摆出来。
+# ---------------------------------------------------------------
+_REVIEW_MIN_AGE_DAYS = 14
+_REVIEW_IDLE_DAYS = 14
+_REVIEW_MAX_IMPORTANCE = 6
+_REVIEW_KEEP_DAYS = 60
+
+
+def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
+    from datetime import datetime as _dt, date as _date
+    from utils import days_since_iso as _days_since
+    today = today or _dt.utcnow().date()
+    rows = []
+    for b in all_buckets:
+        meta = b.get("metadata") or {}
+        # 导入的(别处带来的背景经历)和她在 dashboard 亲手写的, 都不拿来问"要不要放下"
+        if meta.get("created_by") in ("import", "user"):
+            continue
+        if (meta.get("type", "dynamic") != "dynamic" or meta.get("resolved") or is_protected(meta)
+                or is_highlighted(meta) or is_internalized(meta) or meta.get("anchor") or meta.get("dont_surface")):
+            continue
+        try:
+            importance = int(meta.get("importance") or 5)
+        except (TypeError, ValueError):
+            importance = 5
+        if importance > _REVIEW_MAX_IMPORTANCE:
+            continue
+        keep_until = str(meta.get("review_keep_until") or "")[:10]
+        try:
+            if keep_until and _date.fromisoformat(keep_until) >= today:
+                continue
+        except ValueError:
+            pass
+        day = _bucket_day(meta)
+        if day is None or (today - day).days < _REVIEW_MIN_AGE_DAYS:
+            continue
+        if _days_since(meta.get("last_active") or meta.get("created") or "", fallback_days=0) < _REVIEW_IDLE_DAYS:
+            continue
+        age = (today - day).days
+        rows.append({
+            "id": b["id"],
+            "name": meta.get("name") or b["id"],
+            "day": day.isoformat(),
+            "age_days": age,
+            "domain": [str(d) for d in (meta.get("domain") or []) if d],
+            "importance": importance,
+            "preview": strip_wikilinks(str(b.get("content") or ""))[:180],
+            "_rank": (-importance, age),   # 先问最不重要的, 同重要度里先问最久远的
+        })
+    rows.sort(key=lambda r: r["_rank"], reverse=True)
+    for r in rows:
+        r.pop("_rank", None)
+    return rows[:limit]
+
+
 def _relations_for_api(meta: dict) -> list:
     """把 relation_links 精简成前端用的 [{target, type, label}]; 数据写坏就返回空, 不让列表接口失败。"""
     try:
@@ -1123,8 +1336,9 @@ async def _breath_impl(
         results = []
         for b in plans:
             meta = b.get("metadata") or {}
+            due_tag = f" [约在:{meta.get('due')}]" if meta.get("due") else ""
             entry = (f"[{str(meta.get('created', ''))[:10]}] [bucket_id:{b['id']}] "
-                     f"[weight:{meta.get('weight', '?')}]\n{strip_wikilinks(b.get('content', ''))}")
+                     f"[weight:{meta.get('weight', '?')}]{due_tag}\n{strip_wikilinks(b.get('content', ''))}")
             if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
                 break
             results.append(entry)
@@ -1316,16 +1530,36 @@ async def _breath_impl(
         except Exception:
             pass
 
-        if not pinned_results and not protected_results and not dynamic_results:
+        # --- 快到的约定 + 一个月/一年前的今天(独立段, 不进权重池) ---
+        plan_lines = []
+        if not date_filtered:
+            for due, delta, pb in _upcoming_plans(all_buckets):
+                plan_lines.append(f"📅 {due.isoformat()}（{_due_phrase(delta)}）[bucket_id:{pb['id']}] "
+                                  f"{strip_wikilinks(pb.get('content', ''))}")
+        day_lines = []
+        if not date_filtered:
+            for title, db in _on_this_day(all_buckets, exclude_ids=set(surfaced_ids)):
+                try:
+                    clean_meta = {k: v for k, v in db["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(strip_wikilinks(db["content"]), clean_meta)
+                except Exception:
+                    summary = strip_wikilinks(db.get("content", ""))[:300]
+                day_lines.append(f"🕰 {title} [bucket_id:{db['id']}] {summary}")
+
+        if not pinned_results and not protected_results and not dynamic_results and not plan_lines and not day_lines:
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
+        if plan_lines:
+            parts.append("=== 快到的约定 ===\n" + "\n".join(plan_lines))
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if protected_results:
             parts.append("=== 永久参考 ===\n" + "\n---\n".join(protected_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
+        if day_lines:
+            parts.append("=== 那天 ===\n" + "\n---\n".join(day_lines))
         return "\n\n".join(parts)
 
     # --- With args: search mode (keyword + vector dual channel) ---
@@ -1775,6 +2009,7 @@ async def hold(
         if quote_list:
             await bucket_mgr.update(bucket_id, quotes=quote_list)
         _schedule_relation_link(bucket_id, content)
+        _schedule_place_extraction(bucket_id, content, domain, bucket_type="permanent")
         return f"📌钉选→{bucket_id} {','.join(str(d) for d in domain if d is not None)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -1810,6 +2045,11 @@ async def hold(
 @mcp.tool()
 async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance,quotes}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。quotes 同 hold(每条最多3句、每句100字,任一条超限整次拒绝);只有 items 方式能带引语,content 方式是系统替你拆的,不带。"""
+    return await _grow_impl(content=content, event_time=event_time, items=items)
+
+
+async def _grow_impl(content: str = "", event_time: str = "", items: list | None = None, raw_source: str = "") -> str:
+    """grow 的实现。raw_source: capture-hook 传入的这一段对话原文, 挂到这次拆出/合并到的每条记忆上, 供 source 工具读取。"""
     await decay_engine.ensure_started()
     grow_batch_id = f"grow_{uuid.uuid4().hex[:16]}"
 
@@ -1861,6 +2101,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
             try:
                 analysis = await _analyze_with_fallback(item_content)
                 result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
                     content=item_content,
                     tags=analysis.get("tags") or [],
                     importance=item_importance if item_importance is not None else 5,
@@ -1903,6 +2144,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         analysis = await _analyze_with_fallback(content)
         result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
             content=content.strip(),
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1932,6 +2174,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         logger.warning("grow digest 为空, 整段存为单条记忆 (兜底防丢)")
         analysis = await _analyze_with_fallback(content)
         result_name, _is_merged = await _merge_or_create(
+                    raw_source=raw_source,
             content=content.strip(),
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1961,6 +2204,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                 results.append(f"⚠️{item.get('name', '?')}（{item_size_error}）")
                 continue
             result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -2030,8 +2274,9 @@ async def trace(
     relink: str = "",
     relation_type: str = "",
     quotes_replace: list | None = None,
+    due: str | None = None,
 ) -> str:
-    """修改记忆元数据或内容。quotes_replace=[...]=订正或删除这条记忆的引语(整体替换;传[]删除全部;只删一句就把要保留的原样传回;只能改和删,不能补录,条数只能持平或减少);unlink="目标id"=双向解除这条记忆与目标之间自动连错的关系;relink="目标id"+relation_type=修改已有关系的类型(caused_by/causes/continuation_of/continues/related_to/same_event,只能改已有的,不能凭空建立,改过的不再被自动推断改写);reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索;钉选/高亮/保护的桶不受影响,想隐藏先取消钉选)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。due=改 plan 的约定日期(YYYY-MM-DD,空字符串=去掉日期);quotes_replace=[...]=订正或删除这条记忆的引语(整体替换;传[]删除全部;只删一句就把要保留的原样传回;只能改和删,不能补录,条数只能持平或减少);unlink="目标id"=双向解除这条记忆与目标之间自动连错的关系;relink="目标id"+relation_type=修改已有关系的类型(caused_by/causes/continuation_of/continues/related_to/same_event,只能改已有的,不能凭空建立,改过的不再被自动推断改写);reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索;钉选/高亮/保护的桶不受影响,想隐藏先取消钉选)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -2059,7 +2304,7 @@ async def trace(
                 ("content", content, ""), ("delete", delete, False), ("hard_delete", hard_delete, False),
                 ("reinforce", reinforce, False), ("status", status, ""), ("weight", weight, -1),
                 ("why_remembered", why_remembered, ""), ("meaning_append", meaning_append, ""),
-                ("quotes_replace", quotes_replace, None),
+                ("quotes_replace", quotes_replace, None), ("due", due, None),
             ) if v != d
         ]
         if _other:
@@ -2078,7 +2323,7 @@ async def trace(
                 ("internalized", internalized, -1), ("event_time", event_time, ""), ("content", content, ""),
                 ("delete", delete, False), ("hard_delete", hard_delete, False), ("reinforce", reinforce, False),
                 ("status", status, ""), ("weight", weight, -1), ("why_remembered", why_remembered, ""),
-                ("meaning_append", meaning_append, ""),
+                ("meaning_append", meaning_append, ""), ("due", due, None),
             ) if v != d
         ]
         if _other:
@@ -2116,6 +2361,7 @@ async def trace(
                 ("dont_surface", dont_surface, -1), ("media_replace", media_replace, None),
                 ("hard_delete", hard_delete, False), ("unlink", unlink, ""), ("relink", relink, ""),
                 ("relation_type", relation_type, ""), ("quotes_replace", quotes_replace, None),
+                ("due", due, None),
             ) if value != default
         ]
         if _other_changes:
@@ -2210,6 +2456,13 @@ async def trace(
         updates["status"] = normalized_status
     if isinstance(weight, (int, float)) and not isinstance(weight, bool) and 0 <= weight <= 1:
         updates["weight"] = float(weight)
+    if due is not None:
+        if (bucket.get("metadata") or {}).get("type") != "plan":
+            return "due 只能用于 plan。"
+        try:
+            updates["due"] = _normalize_due(due)
+        except ValueError as e:
+            return str(e)
     if dont_surface in (0, 1):
         updates["dont_surface"] = bool(dont_surface)
     if media_replace is not None:
@@ -2338,6 +2591,18 @@ async def _trace_relation_edit(bucket_id: str, unlink: str, relink: str, relatio
             "并标记为手动关系，不会再被自动推断改写。")
 
 
+def _normalize_due(value) -> str:
+    """plan 的约定日期: 只收 YYYY-MM-DD(或带时间的 ISO, 取日期部分); 空 = 没有日期。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    from datetime import date as _date
+    try:
+        return _date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        raise ValueError(f"due 日期格式不对: {text}（用 YYYY-MM-DD，比如 2026-10-03）")
+
+
 def _append_plan_change_log(old_history, action: str, **fields) -> list:
     from datetime import datetime as _dt
     history = list(old_history or [])
@@ -2450,9 +2715,14 @@ async def plan(
     related_bucket: str = "",
     weight: float = 0.5,
     why_remembered: str = "",
+    due: str = "",
 ) -> str:
-    """登记待办、承诺或未闭环事项；weight 0~1 表示它压在心头的重量。"""
+    """登记待办、承诺或未闭环事项；weight 0~1 表示它压在心头的重量。due=约好的日子(YYYY-MM-DD, 可选)：快到或过了还没做时，开场 breath 会主动提起。"""
     text = str(content or "").strip()
+    try:
+        due_value = _normalize_due(due)
+    except ValueError as e:
+        return str(e)
     if not text:
         return "内容为空，无法登记计划。"
     size_error = _payload_size_error("计划", text, "max_bucket_bytes", 50 * 1024)
@@ -2490,9 +2760,11 @@ async def plan(
     }
     if str(related_bucket or "").strip():
         updates["related_bucket"] = str(related_bucket).strip()
+    if due_value:
+        updates["due"] = due_value
     await bucket_mgr.update(bucket_id, **updates)
     _invalidate_buckets_cache()
-    return f"📋plan→{bucket_id} [{normalized_status}]"
+    return f"📋plan→{bucket_id} [{normalized_status}]" + (f" 约在 {due_value}" if due_value else "")
 
 
 def _ai_name() -> str:
@@ -3312,6 +3584,125 @@ async def api_relations_backfill(request):
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return JSONResponse({**_RELATION_BACKFILL, "started": True}, status_code=202)
+
+
+# --- 「未分类」记忆重新分类(本 fork 新增) ---
+_RECLASSIFY: dict = {"running": False, "processed": 0, "total": 0, "changed": 0, "skipped": 0,
+                     "errors": 0, "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/reclassify/uncategorized", methods=["GET", "POST"])
+async def api_reclassify_uncategorized(request):
+    """GET 查进度; POST 后台启动一次: 用当前 AI 配置给 domain 为「未分类」的记忆重新分类(只改 domain/tags)。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _RECLASSIFY.get("running"):
+        return JSONResponse(dict(_RECLASSIFY))
+    from reclassify import reclassify_uncategorized
+    _RECLASSIFY.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
+
+    async def _run():
+        try:
+            await reclassify_uncategorized(bucket_mgr, dehydrator, _RECLASSIFY)
+        except Exception as e:
+            _RECLASSIFY["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.error(f"reclassify crashed / 重新分类中断: {e}")
+        finally:
+            _RECLASSIFY["running"] = False
+            _RECLASSIFY["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+            _invalidate_buckets_cache()
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_RECLASSIFY, "started": True}, status_code=202)
+
+
+@mcp.custom_route("/api/review/candidates", methods=["GET"])
+async def api_review_candidates(request):
+    """每周回顾: 可能已经过去的事(见 _review_candidates)。?limit= 默认 30, 最多 100。"""
+    from starlette.responses import JSONResponse
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", 30))))
+    except (TypeError, ValueError):
+        limit = 30
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    items = _review_candidates(all_buckets, limit=limit)
+    total = len(_review_candidates(all_buckets, limit=100000))
+    return JSONResponse({"items": items, "total": total})
+
+
+@mcp.custom_route("/api/review/decide", methods=["POST"])
+async def api_review_decide(request):
+    """body {id, action: "resolve" | "keep"}。resolve = 放下(resolved=1, 沉底, 之后随衰减归档, 可在归档区恢复);
+    keep = 保留, 60 天内不再问。两者都不刷新激活时间。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    bid = str((body or {}).get("id") or "").strip()
+    action = str((body or {}).get("action") or "").strip().lower()
+    if action not in ("resolve", "keep") or not bid:
+        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep)"}, status_code=400)
+    if not await bucket_mgr.get(bid):
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    if action == "resolve":
+        def _fn(post):
+            post["resolved"] = True
+            post["resolved_by"] = "weekly-review"
+            return True
+    else:
+        until = (_dt.utcnow().date() + _td(days=_REVIEW_KEEP_DAYS)).isoformat()
+
+        def _fn(post, _until=until):
+            post["review_keep_until"] = _until
+            return True
+    ok = await bucket_mgr.rewrite_bucket_metadata(bid, _fn)
+    _invalidate_buckets_cache()
+    return JSONResponse({"ok": bool(ok), "id": bid, "action": action})
+
+
+# --- 足迹地图(本 fork 新增) ---
+_PLACES_BACKFILL: dict = {"running": False, "processed": 0, "total": 0, "found": 0, "with_places": 0,
+                          "errors": 0, "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/places", methods=["GET"])
+async def api_places(request):
+    """地图数据: 按城市聚合的地点与对应记忆。含归档区(足迹不该因为记忆沉底就从地图上消失)。"""
+    from starlette.responses import JSONResponse
+    from places import aggregate
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    groups = aggregate(buckets)
+    return JSONResponse({"places": groups, "memories_with_places": len({m["id"] for g in groups for m in g["memories"]})})
+
+
+@mcp.custom_route("/api/places/backfill", methods=["GET", "POST"])
+async def api_places_backfill(request):
+    """GET 查进度; POST 后台给还没看过地点的存量记忆认一遍地点(只看出行领域/带去向字眼的)。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _PLACES_BACKFILL.get("running"):
+        return JSONResponse(dict(_PLACES_BACKFILL))
+    from places import backfill_places
+    _PLACES_BACKFILL.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
+
+    async def _run():
+        try:
+            await backfill_places(bucket_mgr, dehydrator, _PLACES_BACKFILL)
+        except Exception as e:
+            _PLACES_BACKFILL["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.error(f"places backfill crashed / 地点回填中断: {e}")
+        finally:
+            _PLACES_BACKFILL["running"] = False
+            _PLACES_BACKFILL["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_PLACES_BACKFILL, "started": True}, status_code=202)
 
 
 @mcp.custom_route("/api/families", methods=["GET"])
