@@ -1,0 +1,142 @@
+name: 盯上游更新 (P0luz + folio)
+
+# 每两周(每月 1 号和 15 号)检查两位作者有没有新提交, 有就在本仓库开 issue(GitHub 会邮件/App 通知仓库主人)。
+#   · 原作者 P0luz/Ombre-Brain: 只看 main(正式发布线), feature/* 分支太杂不看
+#   · folio ceshihaox-dotcom/OmbreBrain-folio: 看全部分支(开发常在 codex/* 分支上先出现)
+# 状态存在 issue 正文的隐藏标记里(<!-- head:KEY:SHA -->), 不需要额外存储或 secret。
+# 同一来源已有未关闭的更新 issue 时, 新提交以评论追加到那条 issue, 不重复开新 issue。
+# 处理完(移植了或决定不要)就把 issue 关掉; 下次从关掉时记录的位置继续比较。
+
+on:
+  schedule:
+    - cron: '0 8 1,15 * *'   # 每月 1 号、15 号 UTC 08:00 = 英国上午 8 点(冬令时) / 9 点(夏令时)
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const me = { owner: context.repo.owner, repo: context.repo.repo };
+            const LABEL = 'upstream-watch';
+
+            // ---- 要盯的目标 ----
+            const targets = [
+              { key: 'p0luz-main', owner: 'P0luz', repo: 'Ombre-Brain', branch: 'main', who: '原作者 P0luz' },
+            ];
+            const folio = { owner: 'ceshihaox-dotcom', repo: 'OmbreBrain-folio' };
+            const folioBranches = await github.paginate(github.rest.repos.listBranches, { ...folio, per_page: 100 });
+            for (const b of folioBranches) {
+              targets.push({ key: `folio-${b.name.replace(/[^A-Za-z0-9._-]/g, '_')}`, ...folio, branch: b.name,
+                             who: b.name === 'main' ? 'folio 作者(正式版)' : `folio 作者(分支 ${b.name})` });
+            }
+
+            // ---- label ----
+            try { await github.rest.issues.createLabel({ ...me, name: LABEL, color: '8a63d2', description: '上游作者有新提交' }); }
+            catch (e) { if (e.status !== 422) throw e; }
+
+            const issues = await github.paginate(github.rest.issues.listForRepo,
+              { ...me, labels: LABEL, state: 'all', sort: 'created', direction: 'desc', per_page: 100 });
+
+            const headOf = (text, key) => {
+              const m = (text || '').match(new RegExp(`<!-- head:${key}:([0-9a-f]{40}) -->`));
+              return m ? m[1] : null;
+            };
+
+            async function readFile(t, ref, path) {
+              try {
+                const r = await github.rest.repos.getContent({ owner: t.owner, repo: t.repo, path, ref });
+                return Buffer.from(r.data.content, 'base64').toString('utf8');
+              } catch { return null; }
+            }
+            const headings = s => (s || '').split('\n').filter(l => /^## /.test(l)).map(l => l.slice(3).trim());
+
+            for (const t of targets) {
+              const br = await github.rest.repos.getBranch({ owner: t.owner, repo: t.repo, branch: t.branch });
+              const head = br.data.commit.sha;
+              const marker = `<!-- watch:${t.key} -->`;
+
+              const mine = issues.filter(i => (i.body || '').includes(marker));
+              const openIssue = mine.find(i => i.state === 'open');
+              // 最近记录的位置: 优先看未关闭 issue(含评论里的更新), 否则看最近一条
+              let last = null, lastSource = null;
+              if (openIssue) {
+                const comments = await github.paginate(github.rest.issues.listComments, { ...me, issue_number: openIssue.number, per_page: 100 });
+                for (const c of comments.reverse()) { last = headOf(c.body, t.key); if (last) break; }
+                last = last || headOf(openIssue.body, t.key);
+              } else if (mine.length) {
+                last = headOf(mine[0].body, t.key);
+                if (mine[0].comments) {
+                  const comments = await github.paginate(github.rest.issues.listComments, { ...me, issue_number: mine[0].number, per_page: 100 });
+                  for (const c of comments.reverse()) { const h = headOf(c.body, t.key); if (h) { last = h; break; } }
+                }
+              }
+
+              const repoUrl = `https://github.com/${t.owner}/${t.repo}`;
+
+              // 第一次运行: 记一个起点, 开一条立即关闭的 baseline issue, 不打扰
+              if (!mine.length) {
+                const ver = t.owner === 'P0luz' ? (await readFile(t, head, 'VERSION') || '').trim() : '';
+                const r = await github.rest.issues.create({ ...me, labels: [LABEL],
+                  title: `[上游追踪起点] ${t.who}${ver ? ' ' + ver : ''}`,
+                  body: `从这里开始追踪 ${repoUrl}/tree/${t.branch} 。\n\n当前位置: ${repoUrl}/commit/${head}\n\n${marker}\n<!-- head:${t.key}:${head} -->` });
+                await github.rest.issues.update({ ...me, issue_number: r.data.number, state: 'closed', state_reason: 'completed' });
+                core.info(`${t.key}: baseline ${head}`);
+                continue;
+              }
+              if (last === head) { core.info(`${t.key}: 无更新`); continue; }
+
+              // ---- 收集新提交 ----
+              let commits = [], note = '';
+              try {
+                const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner: t.owner, repo: t.repo, basehead: `${last}...${head}` });
+                if (cmp.data.status === 'diverged' || cmp.data.status === 'behind') note = '⚠ 作者改写过历史(强推), 下面列的是最近的提交。\n\n';
+                commits = cmp.data.commits;
+              } catch (e) {
+                note = '⚠ 上次记录的位置已不存在(作者可能强推或删了分支历史), 下面列的是最近 30 个提交。\n\n';
+              }
+              if (!commits.length || note) {
+                const r = await github.rest.repos.listCommits({ owner: t.owner, repo: t.repo, sha: t.branch, per_page: 30 });
+                commits = r.data.reverse();
+              }
+              const lines = commits.slice(-60).map(c =>
+                `- ${c.commit.author.date.slice(0, 10)} [\`${c.sha.slice(0, 7)}\`](${c.html_url}) ${c.commit.message.split('\n')[0]}`);
+              if (commits.length > 60) lines.unshift(`(共 ${commits.length} 个提交, 只列最近 60 个)`);
+
+              // 版本号 + 新 CHANGELOG 小节
+              let verLine = '', newSections = [];
+              const vHead = (await readFile(t, head, 'VERSION') || '').trim();
+              const vLast = last ? (await readFile(t, last, 'VERSION') || '').trim() : '';
+              if (vHead) verLine = vLast && vLast !== vHead ? `版本: ${vLast} → **${vHead}**` : `版本: ${vHead}`;
+              const clHead = await readFile(t, head, 'CHANGELOG.md');
+              const clLast = last ? await readFile(t, last, 'CHANGELOG.md') : null;
+              if (clHead) {
+                const old = new Set(headings(clLast));
+                newSections = headings(clHead).filter(h => !old.has(h)).slice(0, 20);
+              }
+
+              const body = [
+                `@${me.owner} ${t.who} 有 ${commits.length} 个新提交。`,
+                verLine,
+                newSections.length ? `\n**CHANGELOG 新增小节:**\n${newSections.map(s => '- ' + s).join('\n')}` : '',
+                `\n**提交:**\n${note}${lines.join('\n')}`,
+                last ? `\n对比: ${repoUrl}/compare/${last.slice(0, 12)}...${head.slice(0, 12)}` : '',
+                `\n下次打开 Claude Code 时说「看看上游更新」, 评估哪些值得搬过来。处理完关掉这条 issue。`,
+                `\n${marker}\n<!-- head:${t.key}:${head} -->`,
+              ].filter(Boolean).join('\n');
+
+              if (openIssue) {
+                await github.rest.issues.createComment({ ...me, issue_number: openIssue.number, body });
+                core.info(`${t.key}: 追加到 #${openIssue.number}`);
+              } else {
+                const title = `[上游更新] ${t.who}${vHead && vLast !== vHead ? ` ${vLast ? vLast + ' → ' : ''}${vHead}` : ''}: ${commits.length} 个新提交`;
+                const r = await github.rest.issues.create({ ...me, labels: [LABEL], title, body });
+                core.info(`${t.key}: 新 issue #${r.data.number}`);
+              }
+            }
