@@ -17,11 +17,18 @@ import math
 import sqlite3
 import logging
 import asyncio
+from collections import OrderedDict
 from pathlib import Path
 
 from openai import AsyncOpenAI
 
+from utils import coerce_bool, positive_float
+
 logger = logging.getLogger("ombre_brain.embedding")
+
+# 进程内 LRU 查询缓存上限(对齐上游 2.4.13): 同一段文本对同一模型的向量恒定,
+# 短时间内的重复请求(search+向量兜底同一 query / hold 链路同一新内容)只打一次 API。
+_EMBED_CACHE_MAXSIZE = 128
 
 
 class EmbeddingEngine:
@@ -41,24 +48,37 @@ class EmbeddingEngine:
         self.api_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
         self.base_url = embed_cfg.get("base_url") or dehy_cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai/"
         self.model = embed_cfg.get("model", "gemini-embedding-001")
-        self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
+        # coerce_bool: YAML 里写成带引号的 "false" 也不误开(对齐上游 2.5.3)
+        self.enabled = bool(self.api_key) and coerce_bool(embed_cfg.get("enabled"), default=True)
+        # embedding 请求超时可配(对齐上游 2.4.5):
+        # env OMBRE_EMBED_TIMEOUT_SECONDS > config embedding.timeout_seconds > 30s
+        self.timeout_seconds = positive_float(
+            os.environ.get("OMBRE_EMBED_TIMEOUT_SECONDS") or embed_cfg.get("timeout_seconds"),
+            30.0,
+        )
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
+
+        # --- 进程内 LRU: (model, text) → vector (对齐上游 2.4.13) ---
+        self._embed_cache: "OrderedDict[str, list[float]]" = OrderedDict()
 
         # --- Initialize client ---
         if self.enabled:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=30.0,
+                timeout=self.timeout_seconds,
             )
         else:
             self.client = None
 
         # --- Initialize SQLite ---
         self._init_db()
+
+    # 建库早于 model 列的历史行没有 model 值 — 按当年唯一在用的模型归属
+    _LEGACY_MODEL = "gemini-embedding-001"
 
     def _init_db(self):
         """Create embeddings table if not exists."""
@@ -71,8 +91,31 @@ class EmbeddingEngine:
                 updated_at TEXT NOT NULL
             )
         """)
+        # 模型感知(2026-07-04): 不同模型的向量空间不可混算(同维度也不行)。
+        # 每行记生成时的模型名; 读取侧只认当前模型的向量 → 换模型后旧向量
+        # 自动视为"缺失", backfill 重灌即可, 不会静默混算出垃圾相似度。
+        try:
+            conn.execute("ALTER TABLE embeddings ADD COLUMN model TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
         conn.commit()
         conn.close()
+
+    def _model_matches(self, stored_model: str) -> bool:
+        """空值(老库)按 _LEGACY_MODEL 归属; 只有与当前模型一致的向量才可用。"""
+        return (stored_model or self._LEGACY_MODEL) == self.model
+
+    def _query_text(self, query: str) -> str:
+        """查询侧文本预处理 — Qwen3-Embedding 系官方用法: 查询要带 instruction
+        前缀、文档侧保持原文(非对称检索)。不带前缀 = 降级模式, 检索质量明显打折
+        (实测: 换说法查询从可召回掉到完全召不回)。其他模型原样返回不受影响。"""
+        if "qwen3-embedding" in (self.model or "").lower():
+            instruct = os.environ.get(
+                "OMBRE_EMBED_QUERY_INSTRUCT",
+                "Given a chat message from the user, retrieve relevant personal memories about the user and the assistant",
+            )
+            return f"Instruct: {instruct}\nQuery: {query}"
+        return query
 
     async def generate_and_store(self, bucket_id: str, content: str) -> bool:
         """
@@ -97,25 +140,36 @@ class EmbeddingEngine:
         """Call API to generate embedding vector."""
         # Truncate to avoid token limits
         truncated = text[:2000]
+        # LRU 命中: 同一模型同一文本的向量恒定, 不再重打 API(对齐上游 2.4.13)
+        cache_key = f"{self.model}:{truncated}"
+        cached = self._embed_cache.get(cache_key)
+        if cached is not None:
+            self._embed_cache.move_to_end(cache_key)
+            return list(cached)
         try:
             response = await self.client.embeddings.create(
                 model=self.model,
                 input=truncated,
             )
             if response.data and len(response.data) > 0:
-                return response.data[0].embedding
+                embedding = response.data[0].embedding
+                self._embed_cache[cache_key] = list(embedding)
+                self._embed_cache.move_to_end(cache_key)
+                if len(self._embed_cache) > _EMBED_CACHE_MAXSIZE:
+                    self._embed_cache.popitem(last=False)
+                return embedding
             return []
         except Exception as e:
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
-        """Store embedding in SQLite."""
+        """Store embedding in SQLite (带生成模型名)."""
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso()),
+            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at, model) VALUES (?, ?, ?, ?)",
+            (bucket_id, json.dumps(embedding), now_iso(), self.model),
         )
         conn.commit()
         conn.close()
@@ -128,13 +182,14 @@ class EmbeddingEngine:
         conn.close()
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
-        """Retrieve stored embedding for a bucket. Returns None if not found."""
+        """Retrieve stored embedding for a bucket.
+        Returns None if not found — 或者存的是别的模型的向量(等同缺失, 触发 backfill 重灌)。"""
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
-            "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            "SELECT embedding, model FROM embeddings WHERE bucket_id = ?", (bucket_id,)
         ).fetchone()
         conn.close()
-        if row:
+        if row and self._model_matches(row[1]):
             try:
                 return json.loads(row[0])
             except json.JSONDecodeError:
@@ -151,16 +206,16 @@ class EmbeddingEngine:
             return []
 
         try:
-            query_embedding = await self._generate_embedding(query)
+            query_embedding = await self._generate_embedding(self._query_text(query))
             if not query_embedding:
                 return []
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return []
 
-        # Load all embeddings from SQLite
+        # Load all embeddings from SQLite (只取当前模型的向量 — 跨模型不可混算)
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        rows = conn.execute("SELECT bucket_id, embedding, model FROM embeddings").fetchall()
         conn.close()
 
         if not rows:
@@ -168,7 +223,9 @@ class EmbeddingEngine:
 
         # Calculate cosine similarity
         results = []
-        for bucket_id, emb_json in rows:
+        for bucket_id, emb_json, stored_model in rows:
+            if not self._model_matches(stored_model):
+                continue
             try:
                 stored_embedding = json.loads(emb_json)
                 sim = self._cosine_similarity(query_embedding, stored_embedding)

@@ -12,6 +12,8 @@ import re
 from openai import AsyncOpenAI
 import frontmatter
 
+from utils import atomic_write_text, sideline_stale_dest
+
 ANALYZE_PROMPT = (
     "你是一个内容分析器。请分析以下文本，输出结构化的元数据。\n\n"
     "分析规则：\n"
@@ -95,9 +97,8 @@ async def reclassify():
         if new_name:
             post.metadata["name"] = new_name
 
-        # 写回文件
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(frontmatter.dumps(post))
+        # 写回文件(原子写, 对齐上游 2.5.0 记忆安全)
+        atomic_write_text(fpath, frontmatter.dumps(post))
 
         # 移动到正确目录
         primary = sanitize(new_domain[0]) if new_domain else "未分类"
@@ -109,6 +110,7 @@ async def reclassify():
         dest = os.path.join(target_dir, new_filename)
 
         if dest != fpath:
+            sideline_stale_dest(dest)
             os.rename(fpath, dest)
 
         print(f"  OK {basename}")
