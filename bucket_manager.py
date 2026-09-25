@@ -1293,6 +1293,25 @@ class BucketManager:
                 post["level"] = 1 if int(kwargs["level"]) == 1 else 2
             except (TypeError, ValueError):
                 post["level"] = 2
+        if "quotes" in kwargs:
+            # 整体替换(已由调用方归一化 / 校验); 空列表 = 删除全部引语
+            from quote_store import normalize_quotes
+            quotes = normalize_quotes(kwargs["quotes"])
+            if quotes:
+                post["quotes"] = quotes
+            else:
+                _drop("quotes")
+        if "quotes_append" in kwargs:
+            # 合并到已有桶: 追加不覆盖(每条引语属于它自己的时刻), 超上限保留先来的
+            from quote_store import normalize_quotes, quotes_from_metadata, MAX_QUOTES
+            existing = quotes_from_metadata(post.metadata)
+            seen = {(q["text"], q.get("speaker", "")) for q in existing}
+            for q in normalize_quotes(kwargs["quotes_append"]):
+                if (q["text"], q.get("speaker", "")) not in seen and len(existing) < MAX_QUOTES:
+                    existing.append(q)
+                    seen.add((q["text"], q.get("speaker", "")))
+            if existing:
+                post["quotes"] = existing
         if "why_remembered" in kwargs:
             why = str(kwargs["why_remembered"] or "").strip()[:500]
             if why:
@@ -1717,6 +1736,55 @@ class BucketManager:
                 return {"ok": False, "error": "not_erasable_test_data"}
             deleted = await self._purge_locked(bucket_id)
             return {"ok": deleted, "deleted": deleted, "reason": clean_reason}
+
+    async def mutate_relation_pair(self, left_bucket_id: str, right_bucket_id: str, mutation):
+        """在两把有序的桶锁下原子地修改一对互为镜像的 relation_links(移植自上游 3.2.0)。
+
+        ``mutation(left_post, right_post)`` 返回 ``(left_changed, right_changed, result)``。
+        两个文件在同时持有两把跨进程桶锁时读取; 第二个写失败时把已写的第一个恢复原样再抛错。
+        按 id 排序加锁, 避免两个方向同时连同一对桶时死锁。只改 relation_links, 不刷新 last_active。
+        """
+        left_bucket_id = str(left_bucket_id or "").strip()
+        right_bucket_id = str(right_bucket_id or "").strip()
+        if not left_bucket_id or not right_bucket_id or left_bucket_id == right_bucket_id:
+            return None
+
+        first_id, second_id = sorted((left_bucket_id, right_bucket_id))
+        async with self._bucket_turn(first_id):
+            async with self._bucket_turn(second_id):
+                left_path = self._find_bucket_file(left_bucket_id)
+                right_path = self._find_bucket_file(right_bucket_id)
+                if not left_path or not right_path:
+                    return None
+                try:
+                    left_post = frontmatter.load(left_path)
+                    right_post = frontmatter.load(right_path)
+                except Exception:
+                    return None
+
+                left_before = frontmatter.dumps(left_post)
+                right_before = frontmatter.dumps(right_post)
+                left_changed, right_changed, result = mutation(left_post, right_post)
+                if not left_changed and not right_changed:
+                    return result
+
+                left_written = right_written = False
+                try:
+                    if left_changed:
+                        _atomic_write_text(left_path, frontmatter.dumps(left_post))
+                        left_written = True
+                    if right_changed:
+                        _atomic_write_text(right_path, frontmatter.dumps(right_post))
+                        right_written = True
+                except Exception:
+                    if left_written:
+                        _atomic_write_text(left_path, left_before)
+                    if right_written:
+                        _atomic_write_text(right_path, right_before)
+                    raise
+                finally:
+                    self._invalidate_active_cache()
+                return result
 
     async def set_anchor(self, bucket_id: str, value: bool) -> dict:
         """Toggle an anchor under a global quota turn so the 24-item cap is race-safe."""

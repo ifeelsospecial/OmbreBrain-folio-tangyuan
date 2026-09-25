@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, urlencode
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 from bucket_manager import BucketManager, ACCESS_LEVEL
 from dehydrator import Dehydrator
@@ -318,10 +319,10 @@ async def breath_hook(request):
     from starlette.responses import PlainTextResponse
     try:
         all_buckets = await bucket_mgr.list_all(include_archive=False)
-        # 核心准则段:highlight=True 的桶始终浮现(已内化的隐藏)
+        # 核心准则段:highlight=True 的桶始终浮现。不因"已内化"消失(对齐上游 3.2.0: 核心准则与坐标系不可被消化——
+        # 给一条准则写了 feel 不该让它从开场里静默缺席; 想隐藏就取消钉选)
         pinned = [b for b in all_buckets
                   if is_highlighted(b["metadata"])
-                  and not is_internalized(b["metadata"])
                   and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
                   and not b["metadata"].get("anchor", False)
                   and not b["metadata"].get("dont_surface", False)]
@@ -329,7 +330,6 @@ async def breath_hook(request):
         protected_only_hook = [b for b in all_buckets
                                if is_protected(b["metadata"])
                                and not is_highlighted(b["metadata"])
-                               and not is_internalized(b["metadata"])
                                and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
                                and not b["metadata"].get("anchor", False)
                                and not b["metadata"].get("dont_surface", False)]
@@ -737,6 +737,8 @@ async def _merge_or_create(
     source_tool: str = "",
     grow_batch_id: str = "",
     test_data: bool = False,
+    quotes: list | None = None,
+    notes: list | None = None,
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -793,6 +795,17 @@ async def _merge_or_create(
                     update_kwargs["meaning_append"] = meaning
                 if source_tool:
                     update_kwargs["last_merged_by"] = source_tool
+                if quotes:
+                    # 引语追加不覆盖; 超出每桶上限时保留先来的并明确告知(对齐上游 3.1.0 OB-W006), 不静默丢弃
+                    from quote_store import quotes_from_metadata, MAX_QUOTES
+                    have = quotes_from_metadata(bucket["metadata"])
+                    have_keys = {(q["text"], q.get("speaker", "")) for q in have}
+                    fresh = [q for q in quotes if (q["text"], q.get("speaker", "")) not in have_keys]
+                    overflow = max(0, len(have) + len(fresh) - MAX_QUOTES)
+                    if overflow and notes is not None:
+                        notes.append(f"合并进的记忆已有 {len(have)} 条引语，上限 {MAX_QUOTES}，"
+                                     f"本次有 {overflow} 条没存；想换掉旧的用 trace(quotes_replace=...)")
+                    update_kwargs["quotes_append"] = quotes
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
@@ -815,7 +828,22 @@ async def _merge_or_create(
         grow_batch_id=grow_batch_id,
         test_data=test_data,
     )
+    if quotes:
+        await bucket_mgr.update(bucket_id, quotes=quotes)
+    if not test_data:
+        _schedule_relation_link(bucket_id, content)
     return bucket_id, False
+
+
+def _schedule_relation_link(bucket_id: str, content: str) -> None:
+    """新建桶后后台推断桶间关系(对齐上游 3.2.0)。fire-and-forget: 失败只记日志, 不影响写入。"""
+    try:
+        from relation_link import link_new_bucket
+        task = asyncio.create_task(link_new_bucket(bucket_mgr, embedding_engine, bucket_id, content))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    except Exception as e:  # 没有运行中的事件循环等极端情况
+        logger.warning(f"schedule relation link failed / 关系推断未能排队: {e}")
 
 
 # ---------------------------------------------------------------
@@ -824,6 +852,29 @@ async def _merge_or_create(
 # 读不出时间的桶在给了范围时【排除】而非放行: 调用方明说"只要这段时间的", 静默多给等于破坏约定。
 # 核心准则/永久参考不受时间过滤: 它们是准则, 不是那段时间里发生的事(有意的不对称)。
 # ---------------------------------------------------------------
+def _relation_hint_for(bucket: dict, visible_ids: set | None, limit: int = 2) -> str:
+    """桶间关系提示(对齐上游 3.2.0 relation_hint)。只显示目标在当前视野内(活跃、未删除、分级可见)的关系,
+    指向回收站/归档/私密桶的边不冒出来。返回形如 "↳ 相关 → <id>" 的行, 没有则空串。"""
+    try:
+        from relation_store import relation_hint, normalize_relation_links
+        meta = bucket.get("metadata") or {}
+        links = normalize_relation_links(meta.get("relation_links"))
+    except Exception:
+        return ""
+    if not links:
+        return ""
+    if visible_ids is not None:
+        links = [l for l in links if l["target_bucket_id"] in visible_ids]
+    if not links:
+        return ""
+    return relation_hint({"metadata": {**meta, "relation_links": links}}, limit=limit)
+
+
+def _with_hint(text: str, bucket: dict, visible_ids: set | None) -> str:
+    hint = _relation_hint_for(bucket, visible_ids)
+    return f"{text}\n{hint}" if hint else text
+
+
 class _DateRangeError(ValueError):
     pass
 
@@ -974,6 +1025,7 @@ async def _breath_impl(
     catalog: bool = False,
     date_from: str = "",
     date_to: str = "",
+    show_quotes: bool = False,
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。catalog=True=目录模式,只返回名称|域|重要度,不调用LLM或向量服务。"""
     embedding_outbox.ensure_started()
@@ -1067,12 +1119,13 @@ async def _breath_impl(
             logger.error(f"Failed to list buckets for surfacing / 浮现列桶失败: {e}")
             return "记忆系统暂时无法访问。"
 
+        _visible_ids = {b["id"] for b in all_buckets}
+
         # --- Highlighted buckets: always surface as core principles ---
-        # --- 置顶桶(highlight=True):作为核心准则始终浮现(已内化的隐藏) ---
+        # --- 置顶桶(highlight=True):作为核心准则始终浮现; 不因"已内化"消失(对齐上游 3.2.0) ---
         pinned_buckets = [
             b for b in all_buckets
             if is_highlighted(b["metadata"])
-            and not is_internalized(b["metadata"])
             and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
             and not b["metadata"].get("anchor", False)
             and not b["metadata"].get("dont_surface", False)
@@ -1082,7 +1135,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
+                pinned_results.append(_with_hint(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
@@ -1096,7 +1149,6 @@ async def _breath_impl(
             b for b in all_buckets
             if is_protected(b["metadata"])
             and not is_highlighted(b["metadata"])
-            and not is_internalized(b["metadata"])
             and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
             and not b["metadata"].get("anchor", False)
             and not b["metadata"].get("dont_surface", False)
@@ -1106,7 +1158,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                protected_results.append(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}")
+                protected_results.append(_with_hint(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate protected bucket / 钉决桶脱水失败: {e}")
                 continue
@@ -1205,7 +1257,7 @@ async def _breath_impl(
                     break
                 # NOTE: no touch() here — surfacing should NOT reset decay timer
                 score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+                dynamic_results.append(_with_hint(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
                 surfaced_ids.append(b["id"])
                 token_budget -= summary_tokens
             except Exception as e:
@@ -1324,6 +1376,10 @@ async def _breath_impl(
 
     results = []
     token_used = 0
+    try:
+        _search_visible_ids = {b["id"] for b in await bucket_mgr.list_all(include_archive=False)}
+    except Exception:
+        _search_visible_ids = set()
 
     # --- 浮现结果分波并发脱水(对齐上游 2.5.0 性能): 每波 4 条并发, 波间检查 token 预算 ---
     # 旧串行语义"预算用完就不再调 LLM"保留在波粒度: 最多为最后一波多付 ≤3 次脱水调用
@@ -1361,7 +1417,13 @@ async def _breath_impl(
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
-            results.append(summary)
+            if show_quotes:
+                # 引语只从这里出去(对齐上游 3.1.0): 命中的桶里存过原话才原样附上, 平时任何浮现路径都不渲染
+                from quote_store import quotes_from_metadata, render_quotes
+                _q = quotes_from_metadata(bucket.get("metadata"))
+                if _q:
+                    summary = f"{summary}\n[当时的原话]\n{render_quotes(_q)}"
+            results.append(_with_hint(summary, bucket, _search_visible_ids))
             token_used += summary_tokens
 
     # --- 检索只读(对齐上游 3.6.0): 命中不再 touch ---
@@ -1450,12 +1512,13 @@ async def breath_search(
     max_results: int = 20,
     date_from: str = "",
     date_to: str = "",
+    quotes: bool = False,
 ) -> str:
-    """她每条超过15字的消息，回话前无条件带 query 调一次，不判断值不值得查。按关键词检索记忆，query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)。检索是只读的，不会让记忆变重；某条确实要紧时用 trace(bucket_id, reinforce=True)。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
+    """她每条超过15字的消息，回话前无条件带 query 调一次，不判断值不值得查。按关键词检索记忆，query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)。检索是只读的，不会让记忆变重；某条确实要紧时用 trace(bucket_id, reinforce=True)。quotes=True：不只想知道当时发生了什么，还想知道当时到底是怎么说的——命中的记忆里如果存过引语，会原样附在后面；默认不给。引语是写入时挑的几句，不是全文，全文用 source。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
     if not query or not query.strip():
         return "breath_search 需要 query。无参数浮现请用 breath()。"
     return await _breath_impl(query=query, domain=domain, max_results=max_results,
-                              date_from=date_from, date_to=date_to)
+                              date_from=date_from, date_to=date_to, show_quotes=bool(quotes))
 
 
 @mcp.tool()
@@ -1577,9 +1640,10 @@ async def hold(
     why_remembered: str = "",
     meaning: str = "",
     test_data: bool = False,
+    quotes: list | None = None,
 ) -> str:
     """    她说了她的位置、她做的事、她的情绪、她遇到的人——先存再回话，不判断够不够格。
-存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。"""
+存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。quotes=当时说出口、并且你当时就知道它重要的那几句原话,原样留下(["她说的原话", ...] 或 [{"text":..., "speaker":"她"}]),每条记忆最多3句、每句最多100字,超了整次拒绝不截断;只在 breath_search(quotes=True) 命中这条记忆时才会带出来。不是每条记忆都要有引语,想不起哪句特别重要就不传。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -1593,6 +1657,15 @@ async def hold(
     test_data = coerce_bool(test_data, default=False)
     if test_data and (pinned or feel):
         return "test_data 不能与 pinned 或 feel 同时使用。"
+    quote_list = []
+    if quotes not in (None, "", []):
+        if feel:
+            raise ToolError("feel 不支持引语：feel 不参与检索，引语存进去也取不出来；本次未保存。")
+        from quote_store import normalize_quotes
+        try:
+            quote_list = normalize_quotes(quotes)
+        except ValueError as e:
+            raise ToolError(f"{e} 本次未保存。")
     if isinstance(tags, list):
         extra_tags = [str(t).strip() for t in tags if t]
     else:
@@ -1679,6 +1752,9 @@ async def hold(
             meaning=meaning,
             source_tool="hold",
         )
+        if quote_list:
+            await bucket_mgr.update(bucket_id, quotes=quote_list)
+        _schedule_relation_link(bucket_id, content)
         return f"📌钉选→{bucket_id} {','.join(str(d) for d in domain if d is not None)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -1697,11 +1773,14 @@ async def hold(
         meaning=meaning,
         source_tool="hold",
         test_data=test_data,
+        quotes=quote_list or None,
+        notes=(hold_notes := []),
     )
 
     _schedule_plan_resolution(content, result_name)
     action = "合并→" if is_merged else "新建→"
-    return f"{action}{result_name} {','.join(str(d) for d in domain if d is not None)}"
+    tail = ("\n⚠ " + "\n⚠ ".join(hold_notes)) if hold_notes else ""
+    return f"{action}{result_name} {','.join(str(d) for d in domain if d is not None)}{tail}"
 
 
 # =============================================================
@@ -1710,7 +1789,7 @@ async def hold(
 # =============================================================
 @mcp.tool()
 async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。"""
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance,quotes}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。quotes 同 hold(每条最多3句、每句100字,任一条超限整次拒绝);只有 items 方式能带引语,content 方式是系统替你拆的,不带。"""
     await decay_engine.ensure_started()
     grow_batch_id = f"grow_{uuid.uuid4().hex[:16]}"
 
@@ -1728,7 +1807,9 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         if total_cap and total_item_bytes > total_cap:
             return f"grow items 正文总量过大（{total_item_bytes / 1024:.1f} KB > 上限 {total_cap / 1024:.0f} KB），请分批调用。"
         clean = []
-        for item in items:
+        item_quotes = {}
+        from quote_store import normalize_quotes
+        for idx, item in enumerate(items):
             item_importance = None
             if isinstance(item, str):
                 item_content = item.strip()
@@ -1737,6 +1818,11 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                 raw_importance = item.get("importance")
                 if isinstance(raw_importance, int) and 1 <= raw_importance <= 10:
                     item_importance = raw_importance
+                if item.get("quotes") not in (None, "", []):
+                    try:
+                        item_quotes[len(clean)] = normalize_quotes(item.get("quotes"))
+                    except ValueError as e:
+                        raise ToolError(f"第 {idx + 1} 条的引语不合规：{e} 本次未保存任何条目。")
             else:
                 item_content = ""
             if item_content:
@@ -1750,7 +1836,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         results = []
         created = 0
         merged = 0
-        for item_content, item_importance in clean:
+        grow_notes: list = []
+        for item_pos, (item_content, item_importance) in enumerate(clean):
             try:
                 analysis = await _analyze_with_fallback(item_content)
                 result_name, is_merged = await _merge_or_create(
@@ -1765,6 +1852,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                     raw_merge=True,
                     source_tool="grow",
                     grow_batch_id=grow_batch_id,
+                    quotes=item_quotes.get(item_pos),
+                    notes=grow_notes,
                 )
                 if is_merged:
                     results.append(f"📎{result_name}")
@@ -1776,7 +1865,8 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                 logger.warning(f"grow items 条目处理失败 / verbatim item failed: {e}")
                 results.append("⚠️")
         _schedule_plan_resolution("\n".join(item_content for item_content, _ in clean))
-        return f"{len(clean)}条(预拆分·逐字)|新{created}合{merged}\n" + "\n".join(results)
+        tail = ("\n⚠ " + "\n⚠ ".join(grow_notes)) if grow_notes else ""
+        return f"{len(clean)}条(预拆分·逐字)|新{created}合{merged}\n" + "\n".join(results) + tail
 
     if not content or not content.strip():
         return "内容为空，无法整理。"
@@ -1916,8 +2006,12 @@ async def trace(
     hard_delete: bool = False,
     delete_reason: str = "",
     reinforce: bool = False,
+    unlink: str = "",
+    relink: str = "",
+    relation_type: str = "",
+    quotes_replace: list | None = None,
 ) -> str:
-    """修改记忆元数据或内容。reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。quotes_replace=[...]=订正或删除这条记忆的引语(整体替换;传[]删除全部;只删一句就把要保留的原样传回;只能改和删,不能补录,条数只能持平或减少);unlink="目标id"=双向解除这条记忆与目标之间自动连错的关系;relink="目标id"+relation_type=修改已有关系的类型(caused_by/causes/continuation_of/continues/related_to/same_event,只能改已有的,不能凭空建立,改过的不再被自动推断改写);reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索;钉选/高亮/保护的桶不受影响,想隐藏先取消钉选)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1934,6 +2028,57 @@ async def trace(
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
 
+    # --- 关系修正(对齐上游 3.3.0): unlink / relink, 与其他字段更新互斥, 独立早返回 ---
+    if unlink or relink or relation_type:
+        _other = [
+            n for n, v, d in (
+                ("name", name, ""), ("domain", domain, ""), ("valence", valence, -1), ("arousal", arousal, -1),
+                ("importance", importance, -1), ("tags", tags, ""), ("resolved", resolved, -1),
+                ("protected", protected, -1), ("highlight", highlight, -1), ("pinned", pinned, -1),
+                ("internalized", internalized, -1), ("digested", digested, -1), ("event_time", event_time, ""),
+                ("content", content, ""), ("delete", delete, False), ("hard_delete", hard_delete, False),
+                ("reinforce", reinforce, False), ("status", status, ""), ("weight", weight, -1),
+                ("why_remembered", why_remembered, ""), ("meaning_append", meaning_append, ""),
+                ("quotes_replace", quotes_replace, None),
+            ) if v != d
+        ]
+        if _other:
+            raise ToolError(f"unlink / relink 不能和其他修改同时用（同时传了: {', '.join(_other)}）；本次未修改。")
+        return await _trace_relation_edit(bucket_id.strip(), unlink.strip(), relink.strip(), relation_type.strip())
+
+    # --- 订正 / 删除引语(对齐上游 3.4.0 quotes_replace): 与其他修改互斥, 独立早返回 ---
+    # 只能改和删, 不能补录: 能补录的话任何一句话都能被事后追认为"当时就知道重要", 引语就退化成存原文。
+    # 不传 quotes_replace 不等于传 []: None = 不动, [] = 删除全部。
+    if quotes_replace is not None:
+        _other = [
+            n for n, v, d in (
+                ("name", name, ""), ("domain", domain, ""), ("valence", valence, -1), ("arousal", arousal, -1),
+                ("importance", importance, -1), ("tags", tags, ""), ("resolved", resolved, -1),
+                ("protected", protected, -1), ("highlight", highlight, -1), ("pinned", pinned, -1),
+                ("internalized", internalized, -1), ("event_time", event_time, ""), ("content", content, ""),
+                ("delete", delete, False), ("hard_delete", hard_delete, False), ("reinforce", reinforce, False),
+                ("status", status, ""), ("weight", weight, -1), ("why_remembered", why_remembered, ""),
+                ("meaning_append", meaning_append, ""),
+            ) if v != d
+        ]
+        if _other:
+            raise ToolError(f"quotes_replace 不能和其他修改同时用（同时传了: {', '.join(_other)}）；本次未修改。")
+        from quote_store import normalize_quotes, quotes_from_metadata, render_quotes
+        existing_quotes = quotes_from_metadata(bucket.get("metadata"))
+        if not existing_quotes:
+            raise ToolError("这条记忆本来没有引语。引语只能在写入那一刻留下，事后不能补录；本次未修改。")
+        try:
+            new_quotes = normalize_quotes(quotes_replace)
+        except ValueError as e:
+            raise ToolError(f"{e} 本次未修改。")
+        if len(new_quotes) > len(existing_quotes):
+            raise ToolError(f"引语只能改和删，不能增加（原有 {len(existing_quotes)} 条，这次给了 {len(new_quotes)} 条）；本次未修改。")
+        await bucket_mgr.update(bucket_id, quotes=new_quotes)
+        saved = quotes_from_metadata((await bucket_mgr.get(bucket_id) or {}).get("metadata"))
+        if not saved:
+            return f"已删除 {bucket_id} 的全部引语。"
+        return f"已更新 {bucket_id} 的引语，现在是：\n{render_quotes(saved)}"
+
     # --- 显式强化(对齐上游 3.6.0 trace reinforce): 检索只读后唯一的强化入口 ---
     # 按桶而不是按批; 带时间涟漪(一次真实的想起)。与其他字段更新互斥, 独立早返回。
     # 不改内容, 所以放在"用户手写桶不可改"闸门之前。
@@ -1949,7 +2094,8 @@ async def trace(
                 ("why_remembered", why_remembered, ""), ("meaning_append", meaning_append, ""),
                 ("meaning_replace", meaning_replace, None), ("status", status, ""), ("weight", weight, -1),
                 ("dont_surface", dont_surface, -1), ("media_replace", media_replace, None),
-                ("hard_delete", hard_delete, False),
+                ("hard_delete", hard_delete, False), ("unlink", unlink, ""), ("relink", relink, ""),
+                ("relation_type", relation_type, ""), ("quotes_replace", quotes_replace, None),
             ) if value != default
         ]
         if _other_changes:
@@ -2080,6 +2226,96 @@ async def trace(
         if cascaded:
             changed += f" → 同步放下关联记忆 {','.join(cascaded)}"
     return f"已修改记忆桶 {bucket_id}: {changed}"
+
+
+async def _trace_relation_edit(bucket_id: str, unlink: str, relink: str, relation_type: str) -> str:
+    """trace 的关系修正分支(移植自上游 3.3.0 tools/trace/_relation_edit.py)。
+    只做两件事: 「这条不该连」(unlink, 双向物理移除)和「连对了但类型判错」(relink, 改类型并降为手动关系)。
+    都以已存在一条关系为前提——「建立」只归后端自动推断。参数不合法一律抛 ToolError(isError=True),
+    不返回像成功一样的短句, 否则调用方会以为改好了。"""
+    from relation_store import (
+        normalize_relation_links, normalize_relation_type, retype_relation,
+        reverse_relation_type, unlink_relation,
+    )
+    if unlink and relink:
+        raise ToolError("unlink 与 relink 不能同时使用；本次未修改。")
+    if relation_type and not relink:
+        raise ToolError("relation_type 只能配合 relink 使用；本次未修改。")
+    if relink and not relation_type:
+        raise ToolError("relink 必须同时指定 relation_type（caused_by / causes / continuation_of / "
+                        "continues / related_to / same_event）；本次未修改。")
+    target_id = unlink or relink
+    if target_id == bucket_id:
+        raise ToolError("不能把一条记忆和它自己解绑或改写关系；本次未修改。")
+    if relation_type.lower() == "custom":
+        raise ToolError("relation_type 不支持 custom：custom 关系必须带 label，而 trace 没有传 label 的入口；本次未修改。")
+    if relation_type:
+        try:
+            normalize_relation_type(relation_type)
+        except ValueError:
+            raise ToolError(f"未知的 relation_type「{relation_type}」；只支持 caused_by / causes / "
+                            "continuation_of / continues / related_to / same_event。本次未修改。")
+    if not await bucket_mgr.get(target_id):
+        raise ToolError(f"找不到目标记忆 {target_id}；本次未修改。")
+
+    def _read(post):
+        try:
+            return normalize_relation_links(post.metadata.get("relation_links"))
+        except ValueError:
+            return None
+
+    if unlink:
+        def _mutation(left_post, right_post):
+            left_links, right_links = _read(left_post), _read(right_post)
+            if left_links is None or right_links is None:
+                return False, False, "broken"
+            new_left, lc = unlink_relation(left_links, target_id)
+            new_right, rc = unlink_relation(right_links, bucket_id)
+            if lc:
+                left_post["relation_links"] = normalize_relation_links(new_left)
+            if rc:
+                right_post["relation_links"] = normalize_relation_links(new_right)
+            return lc, rc, lc or rc
+        result = await bucket_mgr.mutate_relation_pair(bucket_id, target_id, _mutation)
+        if result == "broken":
+            raise ToolError("这两条记忆的 relation_links 数据有问题，无法自动修改；本次未修改。")
+        if result is None:
+            raise ToolError("找不到要修改的记忆文件；本次未修改。")
+        if not result:
+            return f"{bucket_id} 与 {target_id} 之间本来就没有关系；本次未修改。"
+        return f"已断开 {bucket_id} 与 {target_id} 的关联（双向）。"
+
+    forward = normalize_relation_type(relation_type)
+    backward = reverse_relation_type(forward)
+
+    def _mutation(left_post, right_post):
+        left_links, right_links = _read(left_post), _read(right_post)
+        if left_links is None or right_links is None:
+            return False, False, "broken"
+        in_left = target_id in {str(l.get("target_bucket_id") or "").strip() for l in left_links}
+        in_right = bucket_id in {str(l.get("target_bucket_id") or "").strip() for l in right_links}
+        if not in_left and not in_right:
+            return False, False, "missing"
+        new_left, lc = retype_relation(left_links, target_id, forward)
+        new_right, rc = retype_relation(right_links, bucket_id, backward)
+        if lc:
+            left_post["relation_links"] = normalize_relation_links(new_left)
+        if rc:
+            right_post["relation_links"] = normalize_relation_links(new_right)
+        return lc, rc, lc or rc
+
+    result = await bucket_mgr.mutate_relation_pair(bucket_id, target_id, _mutation)
+    if result == "broken":
+        raise ToolError("这两条记忆的 relation_links 数据有问题，无法自动修改；本次未修改。")
+    if result == "missing":
+        raise ToolError(f"{bucket_id} 与 {target_id} 之间没有已存在的关系，relink 只能修改已有关系的类型，"
+                        "不能凭空建立；本次未修改。")
+    if result is None:
+        raise ToolError("找不到要修改的记忆文件；本次未修改。")
+    if not result:
+        return f"{bucket_id} 与 {target_id} 的关系已经是 {forward}；本次未修改。"
+    return (f"已把 {bucket_id} 与 {target_id} 的关系改为 {forward}（对侧记为 {backward}），"
+            "并标记为手动关系，不会再被自动推断改写。")
 
 
 def _append_plan_change_log(old_history, action: str, **fields) -> list:
@@ -2557,6 +2793,7 @@ async def dream() -> str:
         return "没有需要消化的新记忆。"
 
     parts = []
+    _dream_visible = {x["id"] for x in all_buckets}
     for b in recent:
         meta = b["metadata"]
         resolved_tag = " [已解决]" if meta.get("resolved", False) else " [未解决]"
@@ -2569,7 +2806,7 @@ async def dream() -> str:
             f"主题:{domains} V{val:.1f}/A{aro:.1f} "
             f"创建:{created}\n"
             f"ID: {b['id']}\n"
-            f"{strip_wikilinks(b['content'][:500])}"
+            f"{_with_hint(strip_wikilinks(b['content'][:500]), b, _dream_visible)}"
         )
 
     header = (
