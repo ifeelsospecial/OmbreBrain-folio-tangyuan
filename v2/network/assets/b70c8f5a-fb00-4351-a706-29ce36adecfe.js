@@ -182,7 +182,7 @@ function StarCanvas({
               return (
                 <line
                   key={i}
-                  className={`cs-link ${faded ? 'faded' : ''}`}
+                  className={`cs-link ${l.relation ? 'relation' : ''} ${faded ? 'faded' : ''}`}
                   x1={a.x} y1={a.y} x2={b.x} y2={b.y}
                   strokeWidth={sw / Math.max(0.5, zoom)}
                   opacity={faded ? 0.05 : linkOpacity * Math.min(1, l.weight / 3)}

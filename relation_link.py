@@ -147,3 +147,73 @@ async def link_new_bucket(bucket_mgr, embedding_engine, bucket_id: str, content:
     if built:
         logger.info(f"auto relations built / 自动建立关系: {bucket_id} -> {built} 条")
     return built
+
+
+# ============================================================
+# 存量回填（本 fork 新增）
+# ------------------------------------------------------------
+# 上游的自动关系只在【新建桶】时推断一次，存量记忆永远没有关系。这里对存量做一次补建：
+# 按 created 从旧到新遍历，每条只和【比它早】的桶连——每一对只从较新的一侧处理一次，
+# 方向与实时写入一致（新桶 continuation_of 旧桶）。复用同一套阈值与 merge_auto_links，
+# 已有关系（含手动改过的）不会被改写；重复运行是安全的。
+# 每条调用一次 embedding 查询；中途失败只记日志，继续下一条。
+# ============================================================
+
+async def backfill_links(bucket_mgr, embedding_engine, progress: dict, pause_s: float = 0.2) -> dict:
+    import asyncio
+
+    progress.update({"running": True, "processed": 0, "built": 0, "errors": 0, "total": 0,
+                     "skipped": 0, "last_error": ""})
+    if not embedding_engine or not getattr(embedding_engine, "enabled", False):
+        progress.update({"running": False, "last_error": "embedding 未启用，无法推断关系"})
+        return progress
+
+    buckets = await bucket_mgr.list_all(include_archive=False)
+    eligible = [b for b in buckets if _eligible(b.get("metadata") or {}) and str(b.get("content") or "").strip()]
+    # 按 (created, id) 定一个全序: 同一秒建的桶(grow 批量写入很常见)也分得出先后, 每一对恰好处理一次
+    eligible.sort(key=lambda b: (str((b.get("metadata") or {}).get("created") or ""), b["id"]))
+    rank = {b["id"]: i for i, b in enumerate(eligible)}
+    progress["total"] = len(eligible)
+
+    for bucket in eligible:
+        bucket_id = bucket["id"]
+        try:
+            inferred = await infer_links_for(bucket_mgr, embedding_engine, bucket_id, bucket.get("content", ""))
+            older = [l for l in inferred if rank.get(l["target_bucket_id"], len(rank)) < rank[bucket_id]]
+            if not older:
+                progress["skipped"] += 1
+            for link in older:
+                progress["built"] += await _write_pair(bucket_mgr, bucket_id, link)
+        except Exception as exc:  # noqa: BLE001
+            progress["errors"] += 1
+            progress["last_error"] = f"{bucket_id}: {type(exc).__name__}: {exc}"[:300]
+            logger.warning(f"relation backfill failed / 关系回填失败 {bucket_id}: {exc}")
+        progress["processed"] += 1
+        if pause_s:
+            await asyncio.sleep(pause_s)  # 给 embedding API 留喘息，避免限流
+
+    progress["running"] = False
+    logger.info(f"relation backfill done / 关系回填完成: {progress}")
+    return progress
+
+
+async def _write_pair(bucket_mgr, bucket_id: str, link: dict) -> int:
+    target_id = link["target_bucket_id"]
+    reverse = {**link, "target_bucket_id": bucket_id, "type": reverse_relation_type(link["type"])}
+
+    def _mutation(left_post, right_post):
+        try:
+            left_links = normalize_relation_links(left_post.metadata.get("relation_links"))
+            right_links = normalize_relation_links(right_post.metadata.get("relation_links"))
+        except ValueError:
+            return False, False, 0
+        merged_left = merge_auto_links(left_links, [link])
+        merged_right = merge_auto_links(right_links, [reverse])
+        left_changed, right_changed = merged_left != left_links, merged_right != right_links
+        if left_changed:
+            left_post["relation_links"] = normalize_relation_links(merged_left)
+        if right_changed:
+            right_post["relation_links"] = normalize_relation_links(merged_right)
+        return left_changed, right_changed, int(left_changed or right_changed)
+
+    return int(await bucket_mgr.mutate_relation_pair(bucket_id, target_id, _mutation) or 0)
