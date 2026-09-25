@@ -6,6 +6,7 @@ name: 盯上游更新 (P0luz + folio)
 # 状态存在 issue 正文的隐藏标记里(<!-- head:KEY:SHA -->), 不需要额外存储或 secret。
 # 同一来源已有未关闭的更新 issue 时, 新提交以评论追加到那条 issue, 不重复开新 issue。
 # 处理完(移植了或决定不要)就把 issue 关掉; 下次从关掉时记录的位置继续比较。
+# 注: GitHub 只在"新增/修改本文件的那次 push"被处理时登记 workflow; 若 Actions 页面看不到它, 改一下本文件再推一次即可。
 
 on:
   schedule:
