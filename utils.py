@@ -16,11 +16,27 @@ import time
 import uuid
 import yaml
 import logging
+import asyncio
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from datetime import datetime, date, timezone
+from typing import Callable
 
 
-def atomic_write_text(path: str, text: str) -> None:
+def _win_long_path(path: str | Path) -> str:
+    """Windows 上添加长路径前缀；其他平台原样返回。"""
+    if os.name != "nt":
+        return str(path)
+    resolved = os.path.abspath(str(path))
+    if resolved.startswith("\\\\?\\"):
+        return resolved
+    if resolved.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + resolved[2:]
+    return "\\\\?\\" + resolved
+
+
+def atomic_write_text(path: str | Path, text: str) -> None:
     """原子写文本: 写临时文件 → fsync → os.replace 就位。(对齐上游 2.5.0 记忆安全)
 
     记忆桶是最不能丢的东西。普通 open("w") 写到一半被杀/断电/磁盘写满, 会把文件
@@ -32,17 +48,20 @@ def atomic_write_text(path: str, text: str) -> None:
     PermissionError(截断式写入反而能过) — 短重试 3 次, 仍失败则抛错。
     绝不回退成截断式写入: 报错可重试, 半截文件才是不可挽回的。
     """
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    target = Path(path)
+    directory = target.parent
+    os.makedirs(_win_long_path(directory), exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{uuid.uuid4().hex}.tmp")
+    tmp_long = _win_long_path(tmp)
+    target_long = _win_long_path(target)
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(tmp_long, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
         for attempt in range(3):
             try:
-                os.replace(tmp, path)
+                os.replace(tmp_long, target_long)
                 break
             except PermissionError:
                 if attempt == 2:
@@ -50,11 +69,154 @@ def atomic_write_text(path: str, text: str) -> None:
                 time.sleep(0.05)
     except Exception:
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+            if os.path.exists(tmp_long):
+                os.remove(tmp_long)
         except OSError:
             pass
         raise
+
+
+def atomic_write_bytes(path: str | Path, data: bytes) -> None:
+    """Binary counterpart of ``atomic_write_text`` with Windows long-path support."""
+    path = Path(path)
+    os.makedirs(_win_long_path(path.parent), exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    temp_long = _win_long_path(temp_path)
+    target_long = _win_long_path(path)
+    try:
+        with open(temp_long, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(3):
+            try:
+                os.replace(temp_long, target_long)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+    except Exception:
+        try:
+            if os.path.exists(temp_long):
+                os.remove(temp_long)
+        except OSError:
+            pass
+        raise
+
+
+@asynccontextmanager
+async def filesystem_turn(base_dir: str | Path, key: str, timeout_seconds: float = 30.0):
+    """跨线程、跨事件循环、跨进程串行化同一资源的读改写。
+
+    FastMCP 的请求可能落在不同线程/事件循环，普通 asyncio.Lock 不足以保护
+    Markdown 文件。这里依靠 O_EXCL 原子创建锁文件，并回收超过一分钟的崩溃残留锁。
+    """
+    if not base_dir:
+        yield
+        return
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key))[:160] or "resource"
+    lock_dir = Path(base_dir) / ".locks"
+    os.makedirs(_win_long_path(lock_dir), exist_ok=True)
+    lock_path = lock_dir / f"{safe_key}.lock"
+    lock_long = _win_long_path(lock_path)
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    stale_seconds = max(600.0, timeout_seconds * 10)
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        try:
+            descriptor = os.open(lock_long, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_long).st_mtime > stale_seconds:
+                    os.unlink(lock_long)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {safe_key} lock")
+            await asyncio.sleep(0.01)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+                handle.flush()
+            break
+    try:
+        yield
+    finally:
+        try:
+            with open(lock_long, "r", encoding="utf-8") as handle:
+                owner = handle.read()
+            if owner == token:
+                os.unlink(lock_long)
+        except OSError:
+            pass
+
+
+_config_yaml_lock = threading.RLock()
+
+
+@contextmanager
+def _filesystem_turn_sync(base_dir: str | Path, key: str, timeout_seconds: float = 30.0):
+    """Synchronous companion used by ordinary request handlers and scripts."""
+    safe_key = re.sub(r"[^0-9A-Za-z_.-]+", "_", str(key))[:160] or "resource"
+    lock_dir = Path(base_dir) / ".locks"
+    os.makedirs(_win_long_path(lock_dir), exist_ok=True)
+    lock_path = lock_dir / f"{safe_key}.lock"
+    lock_long = _win_long_path(lock_path)
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    stale_seconds = max(600.0, timeout_seconds * 10)
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        try:
+            descriptor = os.open(lock_long, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.stat(lock_long).st_mtime > stale_seconds:
+                    os.unlink(lock_long)
+                    continue
+            except OSError:
+                pass
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {safe_key} lock")
+            time.sleep(0.01)
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                handle.write(token)
+                handle.flush()
+            break
+    try:
+        yield
+    finally:
+        try:
+            with open(lock_long, "r", encoding="utf-8") as handle:
+                owner = handle.read()
+            if owner == token:
+                os.unlink(lock_long)
+        except OSError:
+            pass
+
+
+def atomic_update_config_yaml(
+    mutate: Callable[[dict], None], config_path: str | Path | None = None
+) -> dict:
+    """加锁读改写 config.yaml，原子替换后回读校验；失败必须如实抛出。"""
+    path = Path(config_path) if config_path else Path(__file__).resolve().with_name("config.yaml")
+    with _config_yaml_lock, _filesystem_turn_sync(path.parent, f"config-{path.name}"):
+        current: dict = {}
+        if os.path.exists(_win_long_path(path)):
+            with open(_win_long_path(path), "r", encoding="utf-8") as handle:
+                loaded = yaml.safe_load(handle) or {}
+            if isinstance(loaded, dict):
+                current = loaded
+        mutate(current)
+        serialized = yaml.dump(current, default_flow_style=False, allow_unicode=True)
+        atomic_write_text(path, serialized)
+        with open(_win_long_path(path), "r", encoding="utf-8") as handle:
+            persisted = yaml.safe_load(handle) or {}
+        if persisted != current:
+            raise OSError("config.yaml verification failed after write")
+        return current
 
 
 def sideline_stale_dest(dest: str) -> None:
@@ -197,6 +359,8 @@ def load_config(config_path: str = None) -> dict:
         "transport": "stdio",
         "log_level": "INFO",
         "buckets_dir": os.path.join(os.path.dirname(os.path.abspath(__file__)), "buckets"),
+        "media_dir": "",
+        "media_max_bytes": 25 * 1024 * 1024,
         "merge_threshold": 75,
         "auto_merge": True,   # False = 关闭相似桶自动合并(永远新建); 默认 True = 上游行为不变
         "dehydration": {
@@ -219,12 +383,15 @@ def load_config(config_path: str = None) -> dict:
             "fuzzy_threshold": 50,
             "max_results": 5,
         },
+        "storage": {
+            "external_change_poll_seconds": 1.0,
+        },
     }
 
     # --- Load user config from YAML file ---
     # --- 从 YAML 文件加载用户自定义配置 ---
     if config_path is None:
-        config_path = os.path.join(
+        config_path = os.environ.get("OMBRE_CONFIG_PATH", "").strip() or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "config.yaml"
         )
 
@@ -280,6 +447,28 @@ def load_config(config_path: str = None) -> dict:
     if env_buckets_dir:
         config["buckets_dir"] = env_buckets_dir
 
+    env_media_dir = os.environ.get("OMBRE_MEDIA_DIR", "").strip()
+    if env_media_dir:
+        config["media_dir"] = env_media_dir
+    env_media_max = os.environ.get("OMBRE_MEDIA_MAX_BYTES", "").strip()
+    if env_media_max:
+        try:
+            config["media_max_bytes"] = max(1, int(env_media_max))
+        except ValueError:
+            logging.warning("Invalid OMBRE_MEDIA_MAX_BYTES=%r; using configured default", env_media_max)
+
+    env_external_poll = os.environ.get("OMBRE_EXTERNAL_CHANGE_POLL_SECONDS", "").strip()
+    if env_external_poll:
+        try:
+            config.setdefault("storage", {})["external_change_poll_seconds"] = max(
+                0.0, float(env_external_poll)
+            )
+        except ValueError:
+            logging.warning(
+                "Invalid OMBRE_EXTERNAL_CHANGE_POLL_SECONDS=%r; using configured default",
+                env_external_poll,
+            )
+
     # auto_merge 开关 — OMBRE_AUTO_MERGE=false 关闭相似桶自动合并(默认 True = 上游行为不变)
     env_auto_merge = os.environ.get("OMBRE_AUTO_MERGE", "")
     if env_auto_merge.strip():
@@ -332,6 +521,12 @@ def load_config(config_path: str = None) -> dict:
             f"Set it to e.g. /opt/render/project/src/buckets (Render) "
             f"or /data (Docker)."
         )
+
+    media_dir = str(config.get("media_dir") or os.path.join(buckets_dir, "_media"))
+    if not os.path.isabs(media_dir):
+        media_dir = os.path.abspath(os.path.join(buckets_dir, media_dir))
+    config["media_dir"] = media_dir
+    os.makedirs(_win_long_path(media_dir), exist_ok=True)
 
     # --- Ensure bucket storage directories exist ---
     # --- 确保记忆桶存储目录存在 ---

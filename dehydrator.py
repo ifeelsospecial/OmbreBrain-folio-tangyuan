@@ -49,6 +49,22 @@ def _short_date(ts) -> str:
         return s[:10]
 
 logger = logging.getLogger("ombre_brain.dehydrator")
+_PROMPT_VERSION = 4
+
+
+def _perspective_rule() -> str:
+    """Keep actor ownership stable in every rewriting prompt."""
+    human = os.environ.get("HUMAN_NAME", "用户").strip() or "用户"
+    ai = os.environ.get("AI_NAME", "AI").strip() or "AI"
+    return (
+        "【视角铁律】\n"
+        f"- AI 那一方一律称「{ai}」；人类那一方一律称「{human}」。\n"
+        f"- 严禁把「我」和「{human}」合并成「双方」「彼此」「用户」等抹掉视角的中性词。\n"
+        "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
+        f"- 反方向同罪：严禁把「{human}」的动作或情绪归给「我」。\n"
+        "- 原文省略主语时，先从紧邻上下文判断；判断不了就保持主语省略，禁止靠猜补一个「我」。\n"
+        f"- 例：『{human}刚下班就来报信——嚎啕大哭后还是把库建好了』不能改成『我嚎啕大哭后把库建好了』。"
+    )
 
 
 # --- Dehydration prompt: instructs cheap LLM to compress information ---
@@ -61,6 +77,9 @@ DEHYDRATE_PROMPT = """你是一个信息压缩专家。请将以下内容脱水�
 3. 保留所有待办/未完成事项
 4. 关键数字、日期、名称必须保留
 5. 目标压缩率 > 70%
+6. 严格保留第一人称和动作归属（见附加的视角铁律）
+7. JSON 结束后立即停止；禁止追加评论、立场、解释、道德判断或角色代入
+8. 只复述输入明确存在的信息，不得生成原文不存在的观点、结论或待办
 
 输出格式（纯 JSON，无其他内容）：
 {
@@ -270,7 +289,7 @@ _DEFAULT_PROMPTS = {
 }
 
 # --- Upstream prompts (P0luz/Ombre-Brain @ upstream/main) ---
-# 用户可以通过配置页「⇆ 对齐原作者版本」按钮一键切到这套
+# 用户可以通过配置页「⇆ 上游 v2.7.6 基线」按钮一键切到这套
 # REDEHYDRATE / REGEN_CONTENT 在上游不存在(本项目独创功能), 不在此 dict
 # DEHYDRATE / MERGE / ANALYZE 跟我们的 default 字节级一致, 仍单列以便上游 prompt 演化时这里可独立追踪
 _UPSTREAM_PROMPTS = {
@@ -347,6 +366,13 @@ def get_prompt(key: str) -> str:
     if isinstance(v, str) and v.strip():
         return v
     return _DEFAULT_PROMPTS.get(key, "")
+
+
+def get_system_prompt(key: str) -> str:
+    prompt = get_prompt(key)
+    if key in {"dehydrate", "digest", "merge", "redehydrate", "regen_content"}:
+        return prompt.rstrip() + "\n\n" + _perspective_rule()
+    return prompt
 
 
 def set_prompts(overrides: dict) -> dict:
@@ -452,15 +478,29 @@ class Dehydrator:
                 content_hash TEXT PRIMARY KEY,
                 summary TEXT NOT NULL,
                 model TEXT NOT NULL,
+                source_hash TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        try:
+            conn.execute("ALTER TABLE dehydration_cache ADD COLUMN source_hash TEXT")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
+    def _source_hash(self, content: str) -> str:
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _cache_key(self, content: str) -> str:
+        """缓存身份包含 API endpoint + model，切换 profile 后不会复用旧摘要。"""
+        prompt_identity = hashlib.sha256(get_system_prompt("dehydrate").encode("utf-8")).hexdigest()
+        identity = f"v{_PROMPT_VERSION}\0{prompt_identity}\0{(self.base_url or '').rstrip('/')}\0{(self.model or '').strip().lower()}\0{content}"
+        return hashlib.sha256(identity.encode()).hexdigest()
+
     def _get_cached_summary(self, content: str) -> str | None:
         """Look up cached dehydration result by content hash."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._cache_key(content)
         conn = sqlite3.connect(self.cache_db_path)
         row = conn.execute(
             "SELECT summary FROM dehydration_cache WHERE content_hash = ?",
@@ -471,20 +511,24 @@ class Dehydrator:
 
     def _set_cached_summary(self, content: str, summary: str):
         """Store dehydration result in cache."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._cache_key(content)
+        source_hash = self._source_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model) VALUES (?, ?, ?)",
-            (content_hash, summary, self.model)
+            "INSERT OR REPLACE INTO dehydration_cache (content_hash, summary, model, source_hash) VALUES (?, ?, ?, ?)",
+            (content_hash, summary, self.model, source_hash)
         )
         conn.commit()
         conn.close()
 
     def invalidate_cache(self, content: str):
         """Remove cached summary for specific content (call when bucket content changes)."""
-        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        content_hash = self._source_hash(content)
         conn = sqlite3.connect(self.cache_db_path)
-        conn.execute("DELETE FROM dehydration_cache WHERE content_hash = ?", (content_hash,))
+        conn.execute(
+            "DELETE FROM dehydration_cache WHERE source_hash = ? OR content_hash = ?",
+            (content_hash, content_hash),
+        )
         conn.commit()
         conn.close()
 
@@ -571,7 +615,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": get_prompt("dehydrate")},
+                {"role": "system", "content": get_system_prompt("dehydrate")},
                 {"role": "user", "content": content[:3000]},
             ],
             max_tokens=self.max_tokens,
@@ -594,7 +638,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": get_prompt("merge")},
+                {"role": "system", "content": get_system_prompt("merge")},
                 {"role": "user", "content": user_msg},
             ],
             max_tokens=self.max_tokens,
@@ -720,6 +764,46 @@ class Dehydrator:
             return self._default_analysis()
         return self._parse_analysis(raw)
 
+    async def judge_plan_resolution(self, plan_text: str, event_text: str) -> dict:
+        """Conservatively decide whether a new event clearly completes a plan."""
+        if not self.api_available:
+            return {"resolved": False, "confidence": 0.0, "reason": "API unavailable"}
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "你是一个保守的计划完成判定器。只有新事件明确说明计划已经完成时才判定 resolved=true；"
+                        "打算做、正在做、部分完成、可能完成都必须是 false。只输出 JSON："
+                        '{"resolved":false,"confidence":0.0,"reason":"简短理由"}'
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": f"计划：\n{str(plan_text)[:4000]}\n\n新事件：\n{str(event_text)[:4000]}",
+                },
+            ],
+            max_tokens=256,
+            temperature=0.0,
+        )
+        if not response.choices:
+            return {"resolved": False, "confidence": 0.0, "reason": "empty response"}
+        raw = response.choices[0].message.content or ""
+        try:
+            data = json.loads(clean_llm_json(raw))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {"resolved": False, "confidence": 0.0, "reason": "invalid response"}
+        try:
+            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+        except (TypeError, ValueError, OverflowError):
+            confidence = 0.0
+        return {
+            "resolved": bool(data.get("resolved", False)),
+            "confidence": confidence,
+            "reason": str(data.get("reason") or "")[:500],
+        }
+
     # ---------------------------------------------------------
     # Parse API JSON response with safety checks
     # 解析 API 返回的 JSON，做安全校验
@@ -817,7 +901,7 @@ class Dehydrator:
         response = await self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": get_prompt("digest")},
+                {"role": "system", "content": get_system_prompt("digest")},
                 {"role": "user", "content": content[:5000]},
             ],
             max_tokens=8192,   # 2048 会把长日记的 JSON 截断→解析失败; 提到 8192(同 redehydrate)
@@ -897,7 +981,7 @@ class Dehydrator:
             create_kwargs = dict(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": get_prompt("redehydrate")},
+                    {"role": "system", "content": get_system_prompt("redehydrate")},
                     {"role": "user", "content": content[:4000]},
                 ],
                 max_tokens=8192,
@@ -977,7 +1061,7 @@ class Dehydrator:
             response = await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": get_prompt("regen_content")},
+                    {"role": "system", "content": get_system_prompt("regen_content")},
                     {"role": "user", "content": user_msg},
                 ],
                 max_tokens=4096,

@@ -1138,6 +1138,21 @@ function MemFullScreen({ id }) {
 
   const m = data.metadata || {};
   const dt = bucketDate({ event_time: m.event_time, created: m.created, last_active: m.last_active });
+  // 删除后回这条记忆所在的"当日"视图(批量整理工作流: 删完接着挑下一条), 没日期才兜底回 home
+  const afterDelete = () => navigate(dt ? '/day/' + dayKeyOf(dt) : '/');
+  const del = async () => {
+    if (!window.confirm('删除「' + (m.name || data.id) + '」?\n移到回收站,可在设置 → 回收站恢复。')) return;
+    try {
+      const r = await fetch('/api/bucket/' + encodeURIComponent(data.id) + '/delete', { method: 'POST' });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        throw new Error(err.error || ('HTTP ' + r.status));
+      }
+      afterDelete();
+    } catch (e) {
+      window.alert('删除失败: ' + (e.message || e));
+    }
+  };
   const dayFmt = dt ? fmtDay(dt) : null;
   const time = dt ? fmtTime(dt) : '';
   const tags = (m.tags || []).filter(t => !String(t).startsWith('__')); // 隐藏 __* 内部 tag
@@ -1206,10 +1221,27 @@ function MemFullScreen({ id }) {
           )}
         </div>
 
+        {m.why_remembered && (
+          <div className="mem-full-text"><p className="lead">为什么记得</p><p>{m.why_remembered}</p></div>
+        )}
+        {Array.isArray(m.meaning) && m.meaning.length > 0 && (
+          <div className="mem-full-text"><p className="lead">意义</p>{m.meaning.map((text, i) => <p key={i}>· {text}</p>)}</div>
+        )}
+        {Array.isArray(m.media) && m.media.length > 0 && (
+          <div className="mem-full-text">
+            <p className="lead">附件 · {m.media.length}</p>
+            {m.media.map((raw, i) => {
+              const item = typeof raw === 'object' ? raw : { path: String(raw) };
+              return <p key={i}><a href={`/api/bucket/${encodeURIComponent(data.id)}/media/${i}`} target="_blank" rel="noreferrer">{item.title || String(item.path || '').split('/').pop() || `附件 ${i + 1}`}</a></p>;
+            })}
+          </div>
+        )}
+
         {/* 关联记忆等以后接通时再加 mem-full-section-hd */}
       </div>
 
       <div className="mem-full-action">
+        <button className="mem-full-fab danger" onClick={del} title="删除" style={{ cursor: 'pointer' }}>✕</button>
         <button className="mem-full-fab" onClick={() => setEditing(true)} title="编辑" style={{ cursor: 'pointer' }}>✎</button>
       </div>
 
@@ -1218,6 +1250,7 @@ function MemFullScreen({ id }) {
           bucketId={data.id}
           onClose={() => setEditing(false)}
           onSaved={() => setRefreshKey(k => k + 1)}
+          onDeleted={afterDelete}
         />
       )}
 
@@ -1593,6 +1626,8 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
   const [hasRawSource, setHasRawSource] = useState(false);
   // 来源 — user / ai / import 三态
   const [createdBy, setCreatedBy] = useState('ai');
+  const [media, setMedia] = useState([]);
+  const [mediaBusy, setMediaBusy] = useState(false);
   // 记下加载时的 noise 初值, save 时若没变就完全不动 resolved 字段
   // (resolved 不止是噪声标记, 还表"已解决/未解决", 不能误覆盖)
   const originalNoiseRef = useRef(false);
@@ -1617,6 +1652,7 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
         setEventTime(toLocalDateTimeStr(m.event_time || m.created || ''));
         setHasRawSource(!!(m.raw_source && String(m.raw_source).trim()));
         setCreatedBy(m.created_by || 'ai');
+        setMedia(Array.isArray(m.media) ? m.media : []);
         setLoading(false);
       })
       .catch(e => { if (!cancel) { setError(e.message); setLoading(false); } });
@@ -1657,6 +1693,46 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
       setHighlight(prevHi);
       alert('噪声标记失败: ' + e.message);
     }
+  };
+
+  const uploadMedia = async (event) => {
+    const files = Array.from(event.target.files || []);
+    event.target.value = '';
+    if (!files.length || mediaBusy) return;
+    if (media.length + files.length > 20) { setError('每条记忆最多保存 20 个附件'); return; }
+    setMediaBusy(true); setError(null);
+    try {
+      let latest = media;
+      for (const file of files) {
+        const dataUrl = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = () => reject(reader.error || new Error('读取文件失败'));
+          reader.readAsDataURL(file);
+        });
+        const response = await fetch('/api/bucket/' + encodeURIComponent(bucketId) + '/media', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data_base64: dataUrl, filename: file.name, title: file.name, type: file.type || 'application/octet-stream' }),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || ('HTTP ' + response.status));
+        latest = body.media || latest;
+      }
+      setMedia(latest);
+    } catch (e) { setError('附件上传失败: ' + (e.message || String(e))); }
+    finally { setMediaBusy(false); }
+  };
+
+  const removeMedia = async (index) => {
+    if (mediaBusy || !window.confirm('从这条记忆移除该附件？持久文件会保留，避免误删。')) return;
+    setMediaBusy(true); setError(null);
+    try {
+      const response = await fetch(`/api/bucket/${encodeURIComponent(bucketId)}/media/${index}`, { method: 'DELETE' });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || ('HTTP ' + response.status));
+      setMedia(body.media || []);
+    } catch (e) { setError('移除附件失败: ' + (e.message || String(e))); }
+    finally { setMediaBusy(false); }
   };
 
   const save = async () => {
@@ -1783,9 +1859,9 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
       if (onDeleted) {
         onDeleted(bucketId);
       } else {
-        // 没传 onDeleted (MemFull 等单条详情页) → 显式回 home, 不依赖 history 栈.
-        // PWA 冷启动直接进 /mem 时 history 没"上一页", back() 行为不稳;
-        // 显式 navigate 保证一定回到列表 + 触发 scroll 恢复, 让连续删除工作流可用.
+        // 没传 onDeleted 的兜底 → 显式回 home, 不依赖 history 栈
+        // (PWA 冷启动直接进 /mem 时 history 没"上一页", back() 行为不稳)。
+        // MemFull 传了 onDeleted=回当日视图, Review 传了自己的列表刷新。
         navigate('/');
       }
     } catch (e) {
@@ -1828,6 +1904,21 @@ function EditSheet({ bucketId, onClose, onSaved, onDeleted }) {
               noise={noise} onToggleNoise={toggleNoise}
               createdBy={createdBy} setCreatedBy={setCreatedBy}
             />
+            <div className="edit-field">
+              <div className="edit-field-lbl">附件 · {media.length}</div>
+              {media.map((raw, index) => {
+                const item = typeof raw === 'object' ? raw : { path: String(raw) };
+                const title = item.title || String(item.path || '').split('/').pop() || `附件 ${index + 1}`;
+                return <div key={(item.path || title) + index} style={{display:'flex',gap:10,alignItems:'center',padding:'8px 0'}}>
+                  <a style={{flex:1,minWidth:0,overflow:'hidden',textOverflow:'ellipsis'}} href={`/api/bucket/${encodeURIComponent(bucketId)}/media/${index}`} target="_blank" rel="noreferrer">{title}</a>
+                  <button type="button" className="cancel" disabled={mediaBusy} onClick={() => removeMedia(index)}>移除</button>
+                </div>;
+              })}
+              <label className="save" style={{display:'inline-block',padding:'9px 14px',marginTop:8}}>
+                {mediaBusy ? '处理中…' : '＋ 添加图片或文件'}
+                <input type="file" multiple disabled={mediaBusy} onChange={uploadMedia} style={{display:'none'}} />
+              </label>
+            </div>
             <button className="edit-delete-btn" onClick={del} disabled={loading || saving}>
               ✕ 删除这条记忆
             </button>
@@ -2898,6 +2989,26 @@ function SettingScreen() {
             <div className="setting-row-mid">
               <div className="setting-row-title">API 配置</div>
               <div className="setting-row-sub">切换 LLM profile / 模型</div>
+            </div>
+            <span className="setting-row-arrow">›</span>
+          </div>
+        </div>
+
+        <div className="setting-section-hd">关系 / 承诺</div>
+        <div className="setting-list">
+          <div className="setting-row" onClick={() => { window.location.href = '/v2/console/commitments/'; }}>
+            <div className="setting-row-ic">◇</div>
+            <div className="setting-row-mid">
+              <div className="setting-row-title">计划、信件与 Anchor</div>
+              <div className="setting-row-sub">管理承诺、自我认知和不主动浮现的记忆</div>
+            </div>
+            <span className="setting-row-arrow">›</span>
+          </div>
+          <div className="setting-row" onClick={() => { window.location.href = '/v2/console/operations/'; }}>
+            <div className="setting-row-ic">⌁</div>
+            <div className="setting-row-mid">
+              <div className="setting-row-title">部署与连接</div>
+              <div className="setting-row-sub">OAuth / Tunnel / 更新与运行自检</div>
             </div>
             <span className="setting-row-arrow">›</span>
           </div>

@@ -34,6 +34,8 @@ import shutil
 import atexit
 import time
 import uuid
+import asyncio
+from contextlib import AsyncExitStack
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -70,12 +72,18 @@ def _filter_by_access_level(buckets: list[dict]) -> list[dict]:
 import jieba
 from rapidfuzz import fuzz
 
+from media_store import MediaStore
 from utils import generate_bucket_id, sanitize_name, safe_path, now_iso, is_highlighted, is_protected, is_internalized
 from utils import atomic_write_text as _atomic_write_text
 from utils import sideline_stale_dest as _sideline_stale_dest
-from utils import parse_iso_datetime, days_since_iso, coerce_bool
+from utils import parse_iso_datetime, days_since_iso, coerce_bool, filesystem_turn
 
 logger = logging.getLogger("ombre_brain.bucket")
+
+_MEANING_ITEM_MAX = 1000
+_MEANING_LIST_MAX_ITEMS = 20
+_PLAN_CHANGE_LOG_MAX_ITEMS = 100
+_ANCHOR_LIMIT = 24
 
 
 class BucketManager:
@@ -90,14 +98,27 @@ class BucketManager:
 
     def __init__(self, config: dict):
         # --- Read storage paths from config / 从配置中读取存储路径 ---
+        self.config = config
         self.base_dir = config["buckets_dir"]
         self.permanent_dir = os.path.join(self.base_dir, "permanent")
         self.dynamic_dir = os.path.join(self.base_dir, "dynamic")
         self.archive_dir = os.path.join(self.base_dir, "archive")
         self.feel_dir = os.path.join(self.base_dir, "feel")
+        self.plan_dir = os.path.join(self.base_dir, "plans")
+        self.letter_dir = os.path.join(self.base_dir, "letters")
         self.trash_dir = os.path.join(self.base_dir, "trash")  # 软删除目录(回收站),可 restore
+        try:
+            media_max_bytes = int(config.get("media_max_bytes") or 25 * 1024 * 1024)
+        except (TypeError, ValueError):
+            media_max_bytes = 25 * 1024 * 1024
+        self.media_store = MediaStore(
+            self.base_dir,
+            str(config.get("media_dir") or os.path.join(self.base_dir, "_media")),
+            max_bytes=media_max_bytes,
+        )
         self.fuzzy_threshold = config.get("matching", {}).get("fuzzy_threshold", 50)
         self.max_results = config.get("matching", {}).get("max_results", 5)
+        self.embedding_outbox = None
 
         # --- Wikilink config / 双链配置 ---
         wikilink_cfg = config.get("wikilink", {})
@@ -165,12 +186,19 @@ class BucketManager:
         # 活跃桶集内存缓存(对齐上游 2.5.0 性能): list_all(include_archive=False) 命中
         # 直接返回, 不再每次全库 os.walk + frontmatter 重解析(touch 涟漪/随机浮现/
         # 导入页每次都全扫, 几百桶时是数十秒级热点)。
-        # 失效策略: ①任何改变桶集合/元数据的写操作调 _invalidate_active_cache;
-        # ②touch/涟漪不清整表, 就地更新缓存条目; ③TTL 兜底(上游没有这层)——
-        # 桶是 Obsidian 可手编的 markdown, 外部直接改盘无法触发①, 最多 stale TTL 秒。
+        # 失效策略: ①内部写操作主动失效; ②touch/涟漪就地更新;
+        # ③按 path/mtime/size 轮询识别 Obsidian/Git/手工外部编辑。
         self._active_cache: "list[dict] | None" = None
-        self._active_cache_at: float = 0.0
-        self._ACTIVE_CACHE_TTL_S = 60.0
+        self._active_file_state: dict[str, tuple[int, int]] = {}
+        self._active_cache_lock = asyncio.Lock()
+        storage_cfg = config.get("storage", {}) or {}
+        try:
+            self.external_change_poll_seconds = max(
+                0.0, float(storage_cfg.get("external_change_poll_seconds", 1.0))
+            )
+        except (TypeError, ValueError):
+            self.external_change_poll_seconds = 1.0
+        self._last_file_state_check = 0.0
 
         # 最近搜索追溯 (ring buffer, 容量 20): 给前端"我这次发消息浮现了哪些"用。
         # 结构: deque([{ts, query, top: [{id, name, score, matched_in, title_hit}, ...]}, ...])
@@ -200,6 +228,78 @@ class BucketManager:
         # 解决: 长 query 在 partial_ratio 下错乱 + 高 valence 桶被 warmth_boost 推得无关键词也排前。
         # 默认 False → 维持原 fuzzy 行为, 开源/上游兼容。
         self.precise_match_mode = coerce_bool(scoring.get("precise_match_mode"), default=False)
+
+    def attach_embedding_outbox(self, outbox) -> None:
+        """Attach the durable derived-index queue after both objects exist."""
+        self.embedding_outbox = outbox
+
+    @staticmethod
+    def _normalize_meaning_item(value) -> str:
+        return str(value or "").strip()[:_MEANING_ITEM_MAX]
+
+    @classmethod
+    def _normalize_meaning_list(cls, values) -> list[str]:
+        if not values:
+            return []
+        if isinstance(values, str):
+            values = [values]
+        result = []
+        for value in values:
+            item = cls._normalize_meaning_item(value)
+            if item:
+                result.append(item)
+            if len(result) >= _MEANING_LIST_MAX_ITEMS:
+                break
+        return result
+
+    def _queue_embedding(self, bucket_id: str, content: str) -> None:
+        outbox = self.embedding_outbox
+        if outbox is None:
+            return
+        try:
+            outbox.enqueue(bucket_id, content)
+        except Exception as exc:
+            # Markdown has already been written. Never turn a derived-index
+            # failure into a lost/failed memory write.
+            logger.error("Failed to persist embedding outbox item for %s: %s", bucket_id, exc)
+
+    def _remove_embedding(self, bucket_id: str) -> None:
+        outbox = self.embedding_outbox
+        if outbox is None:
+            return
+        try:
+            outbox.remove(bucket_id)
+        except Exception as exc:
+            logger.warning("Failed to remove derived embedding for %s: %s", bucket_id, exc)
+
+    def _bucket_turn(self, bucket_id: str):
+        """Serialize read-modify-write operations for one Markdown bucket."""
+        return filesystem_turn(self.base_dir, f"bucket-{bucket_id}")
+
+    def _collect_all_tags(self) -> set[str]:
+        """Collect active user-visible tags for first-of-kind detection."""
+        tags: set[str] = set()
+        for directory in (
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+        ):
+            if not os.path.exists(directory):
+                continue
+            for root, _, files in os.walk(directory):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    bucket = self._load_bucket(os.path.join(root, filename))
+                    if not bucket:
+                        continue
+                    for tag in bucket.get("metadata", {}).get("tags", []) or []:
+                        value = str(tag).strip()
+                        if value and not value.startswith("__"):
+                            tags.add(value)
+        return tags
 
     # Runtime-tunable scoring keys (whitelist; values type-coerced per key).
     # 跟 decay_engine.DEFAULTS 同思路 — 限定可被 /api/scoring-config 改的 key, 防误写。
@@ -297,7 +397,7 @@ class BucketManager:
         """
         import re
         if cls._TOKEN_SPLIT_RE is None:
-            cls._TOKEN_SPLIT_RE = re.compile(r'[\s,。!?:;、《》「」"\'""''()()【】\[\]<>\.\!\?\:;,/\\\|·~`@#\$%\^&\*\+=\-_]+')
+            cls._TOKEN_SPLIT_RE = re.compile(r'''[\s,。！？!?:：;；、，《》「」"'()（）【】\[\]<>./\\|·~`@#$%^&*+=_-]+''')
         raw = cls._TOKEN_SPLIT_RE.split(query or "")
 
         try:
@@ -377,6 +477,8 @@ class BucketManager:
         meta = bucket.get("metadata", {}) or {}
         name = str(meta.get("name") or "")
         summary = str(meta.get("summary") or "")
+        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []))
+        why_remembered = str(meta.get("why_remembered") or "")
         content = str(bucket.get("content") or "")
         domain_str = " ".join(meta.get("domain") or [])
         tags_str = " ".join(meta.get("tags") or [])
@@ -386,6 +488,8 @@ class BucketManager:
             ("domain",  domain_str, 2.5),
             ("tag",     tags_str,   2.0),
             ("summary", summary,    1.5),
+            ("meaning", meaning,    1.0),
+            ("why",     why_remembered, 1.0),
             ("content", content,    self.content_weight),
         ]
 
@@ -678,6 +782,49 @@ class BucketManager:
     # Write content and metadata into a .md file
     # 将内容和元数据写入一个 .md 文件
     # ---------------------------------------------------------
+    @staticmethod
+    def _occupies_high_importance(metadata: dict) -> bool:
+        try:
+            importance = int(metadata.get("importance") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        bucket_type = str(metadata.get("type") or "dynamic").lower()
+        pinned_like = is_protected(metadata) or is_highlighted(metadata) or coerce_bool(metadata.get("pinned"), default=False)
+        return (
+            importance >= 9
+            and not pinned_like
+            and bucket_type not in {"feel", "plan", "letter", "i", "archived", "trashed"}
+            and not coerce_bool(metadata.get("dont_surface"), default=False)
+            and not coerce_bool(metadata.get("resolved"), default=False)
+        )
+
+    async def quota_status(self, exclude_id: str = "") -> dict:
+        rows = await self.list_all(include_archive=False)
+        pinned_ids: set[str] = set()
+        high_ids: set[str] = set()
+        for bucket in rows:
+            bucket_id = str(bucket.get("id") or "")
+            if bucket_id and bucket_id == exclude_id:
+                continue
+            metadata = bucket.get("metadata") or {}
+            if is_protected(metadata) or is_highlighted(metadata) or coerce_bool(metadata.get("pinned"), default=False):
+                pinned_ids.add(bucket_id or str(bucket.get("path") or ""))
+            if self._occupies_high_importance(metadata):
+                high_ids.add(bucket_id or str(bucket.get("path") or ""))
+        limits = self.config.get("limits") or {}
+        try:
+            pinned_limit = max(0, int(limits.get("max_pinned", 20)))
+        except (TypeError, ValueError):
+            pinned_limit = 20
+        try:
+            high_limit = max(0, int(limits.get("max_high_importance", 24)))
+        except (TypeError, ValueError):
+            high_limit = 24
+        return {
+            "pinned": {"count": len(pinned_ids), "limit": pinned_limit},
+            "high_importance": {"count": len(high_ids), "limit": high_limit, "threshold": 9, "degrade_to": 8},
+        }
+
     async def create(
         self,
         content: str,
@@ -694,6 +841,75 @@ class BucketManager:
         event_time: str = None,
         created_by: str = None,
         summary: str = None,
+        media=None,
+        why_remembered: str = "",
+        meaning: str = "",
+        source_tool: str = "",
+        grow_batch_id: str = "",
+        weight: float | None = None,
+        triggered_by: str = "",
+        dont_surface: bool = False,
+        test_data: bool = False,
+        level: int = 1,
+    ) -> str:
+        pinned_like = bool(pinned or protected or highlight)
+        projected = {
+            "importance": 10 if (pinned or protected) else importance,
+            "type": "permanent" if (pinned or protected) else bucket_type,
+            "protected": bool(pinned or protected),
+            "highlight": bool(pinned or highlight),
+            "dont_surface": bool(dont_surface),
+            "resolved": False,
+        }
+        wants_high = self._occupies_high_importance(projected)
+        async with AsyncExitStack() as stack:
+            if pinned_like:
+                await stack.enter_async_context(filesystem_turn(str(self.base_dir), "quota-pinned"))
+            if wants_high:
+                await stack.enter_async_context(filesystem_turn(str(self.base_dir), "quota-high-importance"))
+            quotas = await self.quota_status()
+            pin_cap = quotas["pinned"]["limit"]
+            if pinned_like and pin_cap > 0 and quotas["pinned"]["count"] >= pin_cap:
+                raise ValueError(f"pinned quota reached ({quotas['pinned']['count']}/{pin_cap})")
+            high_cap = quotas["high_importance"]["limit"]
+            if wants_high and high_cap > 0 and quotas["high_importance"]["count"] >= high_cap:
+                importance = 8
+                logger.info("high-importance quota reached; create importance degraded to 8")
+            return await self._create_unlocked(
+                content=content, tags=tags, importance=importance, domain=domain,
+                valence=valence, arousal=arousal, bucket_type=bucket_type, name=name,
+                pinned=pinned, protected=protected, highlight=highlight,
+                event_time=event_time, created_by=created_by, summary=summary, media=media,
+                why_remembered=why_remembered, meaning=meaning, source_tool=source_tool,
+                grow_batch_id=grow_batch_id, weight=weight, triggered_by=triggered_by,
+                dont_surface=dont_surface, test_data=test_data, level=level,
+            )
+
+    async def _create_unlocked(
+        self,
+        content: str,
+        tags: list[str] = None,
+        importance: int = 5,
+        domain: list[str] = None,
+        valence: float = 0.5,
+        arousal: float = 0.3,
+        bucket_type: str = "dynamic",
+        name: str = None,
+        pinned: bool = False,
+        protected: bool = False,
+        highlight: bool = False,
+        event_time: str = None,
+        created_by: str = None,
+        summary: str = None,
+        media=None,
+        why_remembered: str = "",
+        meaning: str = "",
+        source_tool: str = "",
+        grow_batch_id: str = "",
+        weight: float | None = None,
+        triggered_by: str = "",
+        dont_surface: bool = False,
+        test_data: bool = False,
         level: int = 1,
     ) -> str:
         """
@@ -756,6 +972,55 @@ class BucketManager:
             metadata["highlight"] = True
         if summary:
             metadata["summary"] = str(summary)[:600]
+        if why_remembered:
+            metadata["why_remembered"] = str(why_remembered).strip()[:500]
+        meaning_item = self._normalize_meaning_item(meaning)
+        if meaning_item:
+            metadata["meaning"] = [meaning_item]
+        if source_tool:
+            metadata["source_tool"] = str(source_tool).strip()[:32]
+        if grow_batch_id:
+            metadata["grow_batch_id"] = str(grow_batch_id).strip()[:64]
+        if bucket_type == "plan" and weight is not None:
+            try:
+                parsed_weight = float(weight)
+            except (TypeError, ValueError, OverflowError):
+                parsed_weight = 0.5
+            if not math.isfinite(parsed_weight):
+                parsed_weight = 0.5
+            metadata["weight"] = max(0.0, min(1.0, parsed_weight))
+        if triggered_by:
+            metadata["triggered_by"] = str(triggered_by).strip()[:128]
+        if dont_surface:
+            metadata["dont_surface"] = True
+        if test_data:
+            metadata["provenance"] = {
+                "kind": "test",
+                "created_by": str(source_tool or created_by or "developer")[:32],
+                "erasable": True,
+            }
+        try:
+            defaults = (self.config.get("bucket_type_defaults") or {}).get(bucket_type, {})
+            if weight is None and "weight" in defaults and "weight" not in metadata:
+                default_weight = float(defaults["weight"])
+                if math.isfinite(default_weight):
+                    metadata["weight"] = max(0.0, min(1.0, default_weight))
+            if coerce_bool(defaults.get("dont_surface"), default=False):
+                metadata["dont_surface"] = True
+            if not metadata.get("why_remembered") and defaults.get("why_remembered"):
+                metadata["why_remembered"] = str(defaults["why_remembered"]).strip()[:500]
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("Ignored invalid bucket_type_defaults for %s", bucket_type)
+        visible_tags = {str(tag).strip() for tag in tags if str(tag).strip() and not str(tag).startswith("__")}
+        if visible_tags:
+            try:
+                if not (visible_tags & self._collect_all_tags()):
+                    metadata["first_of_kind"] = True
+            except Exception as exc:
+                logger.warning("first_of_kind detection failed: %s", exc)
+        persisted_media = await self.media_store.persist(bucket_id, media)
+        if persisted_media:
+            metadata["media"] = persisted_media
 
         # --- Assemble Markdown file (frontmatter + body) ---
         # --- 组装 Markdown 文件 ---
@@ -769,10 +1034,18 @@ class BucketManager:
                 metadata["type"] = "permanent"
         elif bucket_type == "feel":
             type_dir = self.feel_dir
+        elif bucket_type == "plan":
+            type_dir = self.plan_dir
+        elif bucket_type == "letter":
+            type_dir = self.letter_dir
         else:
             type_dir = self.dynamic_dir
         if bucket_type == "feel":
             primary_domain = "沉淀物"  # feel subfolder name
+        elif bucket_type == "plan":
+            primary_domain = "active"
+        elif bucket_type == "letter":
+            primary_domain = "history"
         else:
             primary_domain = sanitize_name(domain[0]) if domain else "未分类"
         target_dir = os.path.join(type_dir, primary_domain)
@@ -803,6 +1076,7 @@ class BucketManager:
             f"Created bucket / 创建记忆桶: {bucket_id} ({bucket_name}) → {primary_domain}/"
             + (" [" + " ".join(flag_tags) + "]" if flag_tags else "")
         )
+        self._queue_embedding(bucket_id, linked_content)
         return bucket_id
 
     # ---------------------------------------------------------
@@ -825,6 +1099,46 @@ class BucketManager:
         if bucket and not _level_visible(bucket.get("metadata", {})):
             return None
         return bucket
+
+    def find_exact_content(self, content: str, domain_filter: list[str] | None = None) -> Optional[dict]:
+        """直接读活跃 Markdown 查逐字正文，供导入断点重试去重。"""
+        expected = str(content or "").strip()
+        filters = {
+            str(domain).strip().lower()
+            for domain in (domain_filter or [])
+            if str(domain).strip()
+        }
+        for directory in (
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+        ):
+            if not os.path.exists(directory):
+                continue
+            for root, _, files in os.walk(directory):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    bucket = self._load_bucket(os.path.join(root, filename))
+                    if not bucket or str(bucket.get("content") or "").strip() != expected:
+                        continue
+                    metadata = bucket.get("metadata") or {}
+                    # 分级: 受限通道不能通过"内容完全相同"探测/合并进 level-2 私密桶
+                    if not _level_visible(metadata):
+                        continue
+                    if metadata.get("type") == "trashed":
+                        continue
+                    domains = metadata.get("domain") or []
+                    if isinstance(domains, str):
+                        domains = [domains]
+                    if filters and not {
+                        str(domain).strip().lower() for domain in domains
+                    } & filters:
+                        continue
+                    return bucket
+        return None
 
     # ---------------------------------------------------------
     # Move bucket between directories
@@ -852,6 +1166,48 @@ class BucketManager:
     # Supports: content, tags, importance, valence, arousal, name, resolved
     # ---------------------------------------------------------
     async def update(self, bucket_id: str, **kwargs) -> bool:
+        quota_fields = {"pinned", "protected", "highlight", "importance", "type", "dont_surface", "resolved"}
+        if not (quota_fields & set(kwargs)):
+            async with self._bucket_turn(bucket_id):
+                return await self._update_locked(bucket_id, **kwargs)
+        async with AsyncExitStack() as stack:
+            # A pin/unpin can also enter/leave the ordinary importance>=9 pool,
+            # so quota turns always use the same global order.
+            await stack.enter_async_context(filesystem_turn(str(self.base_dir), "quota-pinned"))
+            await stack.enter_async_context(filesystem_turn(str(self.base_dir), "quota-high-importance"))
+            async with self._bucket_turn(bucket_id):
+                current = await self.get(bucket_id)
+                if not current:
+                    return False
+                metadata = dict(current.get("metadata") or {})
+                before_pinned = is_protected(metadata) or is_highlighted(metadata) or coerce_bool(metadata.get("pinned"), default=False)
+                before_high = self._occupies_high_importance(metadata)
+                projected = dict(metadata)
+                if "pinned" in kwargs:
+                    value = bool(kwargs["pinned"])
+                    projected["protected"] = value
+                    projected["highlight"] = value
+                for key in ("protected", "highlight", "importance", "type", "dont_surface", "resolved"):
+                    if key in kwargs:
+                        projected[key] = kwargs[key]
+                if projected.get("protected"):
+                    projected["importance"] = 10
+                    projected["type"] = "permanent"
+                elif metadata.get("protected") and not projected.get("protected") and "importance" not in kwargs:
+                    projected["importance"] = metadata.get("importance_before_protect", metadata.get("importance", 5))
+                after_pinned = is_protected(projected) or is_highlighted(projected) or coerce_bool(projected.get("pinned"), default=False)
+                after_high = self._occupies_high_importance(projected)
+                quotas = await self.quota_status(exclude_id=bucket_id)
+                pin_cap = quotas["pinned"]["limit"]
+                if after_pinned and not before_pinned and pin_cap > 0 and quotas["pinned"]["count"] >= pin_cap:
+                    raise ValueError(f"pinned quota reached ({quotas['pinned']['count']}/{pin_cap})")
+                high_cap = quotas["high_importance"]["limit"]
+                if after_high and not before_high and high_cap > 0 and quotas["high_importance"]["count"] >= high_cap:
+                    kwargs["importance"] = 8
+                    logger.info("high-importance quota reached; update importance degraded to 8")
+                return await self._update_locked(bucket_id, **kwargs)
+
+    async def _update_locked(self, bucket_id: str, **kwargs) -> bool:
         """
         Update bucket content or metadata fields.
         更新桶的内容或元数据字段。
@@ -901,7 +1257,7 @@ class BucketManager:
                     post["importance_before_noise"] = cur_imp
             except (ValueError, TypeError):
                 pass
-        currently_protected = bool(post.get("protected", False)) or kwargs.get("protected", False)
+        currently_protected = bool(kwargs.get("protected", post.get("protected", False)))
         if currently_protected and not marking_noise:
             kwargs.pop("importance", None)  # 静默忽略,protected 始终是 10
 
@@ -937,6 +1293,122 @@ class BucketManager:
                 post["level"] = 1 if int(kwargs["level"]) == 1 else 2
             except (TypeError, ValueError):
                 post["level"] = 2
+        if "why_remembered" in kwargs:
+            why = str(kwargs["why_remembered"] or "").strip()[:500]
+            if why:
+                post["why_remembered"] = why
+            else:
+                _drop("why_remembered")
+        if "dont_surface" in kwargs:
+            if coerce_bool(kwargs["dont_surface"], default=False):
+                post["dont_surface"] = True
+            else:
+                _drop("dont_surface")
+        if "first_of_kind" in kwargs:
+            if coerce_bool(kwargs["first_of_kind"], default=False):
+                post["first_of_kind"] = True
+            else:
+                _drop("first_of_kind")
+        if "anchor" in kwargs:
+            if coerce_bool(kwargs["anchor"], default=False):
+                post["anchor"] = True
+            else:
+                _drop("anchor")
+        if "weight" in kwargs:
+            try:
+                value = float(kwargs["weight"])
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError("weight 必须是 0.0 到 1.0 的有限数字。")
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError("weight 必须是 0.0 到 1.0 的有限数字。")
+            if post.get("type") != "plan":
+                raise ValueError("weight 只能用于 plan 桶。")
+            post["weight"] = value
+        for text_key, limit in (
+            ("triggered_by", 128),
+            ("related_bucket", 128),
+            ("author", 120),
+            ("user_name", 120),
+            ("title", 120),
+            ("letter_date", 64),
+            ("aspect", 32),
+            ("resolution_reason", 500),
+            ("resolved_by", 128),
+        ):
+            if text_key in kwargs:
+                value = str(kwargs[text_key] or "").strip()[:limit]
+                if value:
+                    post[text_key] = value
+                else:
+                    _drop(text_key)
+        if "status" in kwargs:
+            status = str(kwargs["status"] or "").strip().lower()
+            if post.get("type") != "plan":
+                raise ValueError("status 只能用于 plan 桶。")
+            if status not in ("active", "resolved", "abandoned"):
+                raise ValueError("plan status 只能是 active、resolved 或 abandoned。")
+            post["status"] = status
+        if "change_log" in kwargs:
+            history = kwargs["change_log"]
+            if not isinstance(history, list):
+                raise ValueError("change_log 必须是数组。")
+            post["change_log"] = history[-_PLAN_CHANGE_LOG_MAX_ITEMS:]
+        if "meaning" in kwargs:
+            meanings = self._normalize_meaning_list(kwargs["meaning"])
+            if meanings:
+                post["meaning"] = meanings
+            else:
+                _drop("meaning")
+        if "meaning_append" in kwargs:
+            addition = self._normalize_meaning_item(kwargs["meaning_append"])
+            existing_meanings = self._normalize_meaning_list(post.get("meaning") or [])
+            if addition:
+                if len(existing_meanings) >= _MEANING_LIST_MAX_ITEMS:
+                    raise ValueError(f"每条记忆最多保存 {_MEANING_LIST_MAX_ITEMS} 条 meaning。")
+                post["meaning"] = existing_meanings + [addition]
+        for provenance_key, limit in (("source_tool", 32), ("grow_batch_id", 64), ("last_merged_by", 32)):
+            if provenance_key in kwargs:
+                value = str(kwargs[provenance_key] or "").strip()[:limit]
+                if value:
+                    post[provenance_key] = value
+                else:
+                    _drop(provenance_key)
+        if "media_append" in kwargs:
+            additions = await self.media_store.persist(bucket_id, kwargs["media_append"])
+            existing = post.get("media") or []
+            if not isinstance(existing, list):
+                existing = [existing]
+            combined = []
+            seen_media = set()
+            for item in existing + additions:
+                normalized = item if isinstance(item, dict) else {"path": str(item)}
+                media_path = str(normalized.get("path") or "").strip()
+                if not media_path or media_path in seen_media:
+                    continue
+                seen_media.add(media_path)
+                combined.append(normalized)
+            if len(combined) > 20:
+                raise ValueError("每条记忆最多保存 20 个媒体附件。")
+            post["media"] = combined
+        if "media_remove" in kwargs:
+            remove_path = str(kwargs["media_remove"] or "").strip()
+            existing = post.get("media") or []
+            if not isinstance(existing, list):
+                existing = [existing]
+            kept = [
+                item for item in existing
+                if str((item.get("path") if isinstance(item, dict) else item) or "").strip() != remove_path
+            ]
+            if kept:
+                post["media"] = kept
+            else:
+                _drop("media")
+        if "media_replace" in kwargs:
+            replacements = await self.media_store.persist(bucket_id, kwargs["media_replace"])
+            if replacements:
+                post["media"] = replacements
+            else:
+                _drop("media")
         if "resolved" in kwargs:
             post["resolved"] = bool(kwargs["resolved"])
             # 取消噪声: 若调用方没显式改 importance, 则从 importance_before_noise 恢复
@@ -999,7 +1471,7 @@ class BucketManager:
         # 不在此触发目录移动 — 老桶大批量切换时 IO 成本高,后续 breath/list 都按 metadata 读
         if "type" in kwargs:
             new_type = kwargs["type"]
-            if new_type in ("dynamic", "feel", "permanent", "archived"):
+            if new_type in ("dynamic", "feel", "permanent", "archived", "plan", "letter", "i"):
                 post["type"] = new_type
         # created_by(来源分类) — user / ai / import 三态
         # 'ai' 是历史默认 (导入和 AI proactive 都曾混在 ai 里), 现在 import 单独区分。
@@ -1076,9 +1548,13 @@ class BucketManager:
             post["type"] = "dynamic"
             _atomic_write_text(file_path, frontmatter.dumps(post))
             self._move_bucket(file_path, self.dynamic_dir, domain)
+        elif "status" in kwargs and post.get("type") == "plan":
+            self._move_bucket(file_path, self.plan_dir, [post.get("status", "active")])
 
         self._invalidate_active_cache()
         logger.info(f"Updated bucket / 更新记忆桶: {bucket_id}")
+        if "content" in kwargs:
+            self._queue_embedding(bucket_id, post.content)
         return True
 
     # ---------------------------------------------------------
@@ -1097,6 +1573,10 @@ class BucketManager:
     # 删除桶
     # ---------------------------------------------------------
     async def delete(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._delete_locked(bucket_id)
+
+    async def _delete_locked(self, bucket_id: str) -> bool:
         """
         Soft-delete: 移到 trash/ 目录(可在回收站恢复),保留 metadata.original_type
         防止 restore 时丢失原本类型(permanent/dynamic/feel)。
@@ -1129,6 +1609,7 @@ class BucketManager:
             return False
 
         self._invalidate_active_cache()
+        self._remove_embedding(bucket_id)
         logger.info(f"Soft-deleted bucket / 移到回收站: {bucket_id} → trash/{primary_domain}/")
         return True
 
@@ -1136,6 +1617,10 @@ class BucketManager:
     # Restore: 从回收站移回原 type 目录
     # ---------------------------------------------------------
     async def restore(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._restore_locked(bucket_id)
+
+    async def _restore_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1153,6 +1638,12 @@ class BucketManager:
             elif original_type == "feel":
                 target_dir = self.feel_dir
                 primary_domain = "沉淀物"  # feel 子目录固定
+            elif original_type == "plan":
+                target_dir = self.plan_dir
+                primary_domain = str(post.get("status") or "active")
+            elif original_type == "letter":
+                target_dir = self.letter_dir
+                primary_domain = "history"
             elif original_type == "archived":
                 target_dir = self.archive_dir
             else:
@@ -1178,6 +1669,7 @@ class BucketManager:
             logger.error(f"Failed to restore bucket / 恢复桶失败: {bucket_id}: {e}")
             return False
         self._invalidate_active_cache()
+        self._queue_embedding(bucket_id, post.content)
         logger.info(f"Restored bucket / 从回收站恢复: {bucket_id} → {original_type}/{primary_domain}/")
         return True
 
@@ -1185,6 +1677,10 @@ class BucketManager:
     # Purge: 真物理删除(回收站里点"永久删除")
     # ---------------------------------------------------------
     async def purge(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._purge_locked(bucket_id)
+
+    async def _purge_locked(self, bucket_id: str) -> bool:
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
             return False
@@ -1194,8 +1690,69 @@ class BucketManager:
             logger.error(f"Failed to purge bucket file / 物理删除桶失败: {file_path}: {e}")
             return False
         self._invalidate_active_cache()
+        self._remove_embedding(bucket_id)
         logger.info(f"Purged bucket / 物理删除记忆桶: {bucket_id}")
         return True
+
+    async def hard_delete_test_bucket(self, bucket_id: str, *, reason: str = "") -> dict:
+        """Physically erase only a bucket whose immutable creation provenance says test data."""
+        clean_reason = str(reason or "").strip()
+        if not clean_reason or len(clean_reason) > 500:
+            return {"ok": False, "error": "delete_reason_required"}
+        async with self._bucket_turn(bucket_id):
+            file_path = self._find_bucket_file(bucket_id)
+            if not file_path:
+                return {"ok": False, "error": "not_found"}
+            try:
+                post = frontmatter.load(file_path)
+            except Exception:
+                return {"ok": False, "error": "read_failed"}
+            provenance = post.get("provenance") or {}
+            erasable = (
+                isinstance(provenance, dict)
+                and provenance.get("kind") == "test"
+                and coerce_bool(provenance.get("erasable"), default=False)
+            )
+            if not erasable:
+                return {"ok": False, "error": "not_erasable_test_data"}
+            deleted = await self._purge_locked(bucket_id)
+            return {"ok": deleted, "deleted": deleted, "reason": clean_reason}
+
+    async def set_anchor(self, bucket_id: str, value: bool) -> dict:
+        """Toggle an anchor under a global quota turn so the 24-item cap is race-safe."""
+        target = bool(value)
+        async with filesystem_turn(self.base_dir, "quota-anchor"):
+            bucket = await self.get(bucket_id)
+            if not bucket:
+                return {"ok": False, "error": "bucket not found", "count": 0, "limit": _ANCHOR_LIMIT}
+            current = bool(bucket.get("metadata", {}).get("anchor", False))
+            all_buckets = await self.list_all(include_archive=False)
+            count = len({b["id"] for b in all_buckets if b.get("metadata", {}).get("anchor", False)})
+            if current == target:
+                return {
+                    "ok": True,
+                    "anchor": target,
+                    "count": count,
+                    "limit": _ANCHOR_LIMIT,
+                    "noop": True,
+                }
+            if target and count >= _ANCHOR_LIMIT:
+                return {
+                    "ok": False,
+                    "error": f"anchor 已达上限 {_ANCHOR_LIMIT}。请先 release 一条再设置新的。",
+                    "count": count,
+                    "limit": _ANCHOR_LIMIT,
+                }
+            async with self._bucket_turn(bucket_id):
+                ok = await self._update_locked(bucket_id, anchor=target)
+            if not ok:
+                return {"ok": False, "error": "update failed", "count": count, "limit": _ANCHOR_LIMIT}
+            return {
+                "ok": True,
+                "anchor": target,
+                "count": count + (1 if target else -1),
+                "limit": _ANCHOR_LIMIT,
+            }
 
     async def empty_trash(self) -> int:
         """物理删除回收站里所有桶,一次扫盘删全部。返回删除数量。
@@ -1231,7 +1788,7 @@ class BucketManager:
                     buckets.append(bucket)
         # 按 trashed_at 倒序
         buckets.sort(key=lambda b: b.get("metadata", {}).get("trashed_at", ""), reverse=True)
-        return buckets
+        return _filter_by_access_level(buckets)
 
     # ---------------------------------------------------------
     # Touch bucket (refresh activation time + increment count)
@@ -1240,6 +1797,10 @@ class BucketManager:
     # 每次检索命中时调用，影响衰减得分。
     # ---------------------------------------------------------
     async def touch(self, bucket_id: str) -> None:
+        async with self._bucket_turn(bucket_id):
+            await self._touch_locked(bucket_id)
+
+    async def _touch_locked(self, bucket_id: str) -> None:
         """
         Update a bucket's last activation time and count.
         Also triggers time ripple: nearby memories get a slight activation boost.
@@ -1260,7 +1821,7 @@ class BucketManager:
             self._update_active_cache_entry(bucket_id, {
                 "last_active": post["last_active"],
                 "activation_count": post["activation_count"],
-            })
+            }, file_path)
 
             # --- Time ripple: boost nearby memories within ±48h ---
             # --- 时间涟漪：±48小时内的记忆轻微唤醒 ---
@@ -1312,7 +1873,7 @@ class BucketManager:
                     _atomic_write_text(file_path, frontmatter.dumps(post))
                     self._update_active_cache_entry(bucket["id"], {
                         "activation_count": post["activation_count"],
-                    })
+                    }, file_path)
                     rippled += 1
                 except Exception:
                     continue
@@ -1343,6 +1904,7 @@ class BucketManager:
         query_arousal: float = None,
         record_stats: bool = True,
         caller: str = "",
+        result_filter=None,
     ) -> list[dict]:
         """
         Multi-dimensional indexed search for memory buckets.
@@ -1499,6 +2061,18 @@ class BucketManager:
         else:
             scored.sort(key=lambda x: x["score"], reverse=True)
 
+        # 可见性规则必须在 limit 切片之前执行，否则高分但应排除的桶会
+        # 占满窗口，把真正结果挡在切片之外。
+        if result_filter is not None:
+            filtered = []
+            for bucket in scored:
+                try:
+                    if result_filter(bucket):
+                        filtered.append(bucket)
+                except Exception as e:
+                    logger.warning(f"Search result filter failed for {bucket.get('id', '?')}: {e}")
+            scored = filtered
+
         # record_stats=False (即时模拟 dry-run): 不记统计、不污染命中频次, 直接返回结果
         if not record_stats:
             return scored[:limit]
@@ -1628,6 +2202,11 @@ class BucketManager:
         # 各字段独立 partial_ratio
         name_raw = fuzz.partial_ratio(query, meta.get("name", "") or "")
         summary_raw = fuzz.partial_ratio(query, meta.get("summary", "") or "")
+        meaning_raw = max(
+            (fuzz.partial_ratio(query, value) for value in self._normalize_meaning_list(meta.get("meaning") or [])),
+            default=0,
+        )
+        why_raw = fuzz.partial_ratio(query, meta.get("why_remembered", "") or "")
         domain_raw = max(
             (fuzz.partial_ratio(query, d) for d in meta.get("domain", []) if d),
             default=0,
@@ -1647,9 +2226,10 @@ class BucketManager:
         content_score = content_raw * self.content_weight
         # summary 走 bonus 通道,只加分子(权重 1.5),不进分母 → 不稀释其他字段命中
         summary_bonus = summary_raw * 1.5
+        experience_bonus = meaning_raw + why_raw
 
         weight_sum = 3 + 2.5 + 2 + self.content_weight  # 旧分母,保护已有阈值行为
-        score = (name_score + domain_score + tag_score + content_score + summary_bonus) / (100 * weight_sum)
+        score = (name_score + domain_score + tag_score + content_score + summary_bonus + experience_bonus) / (100 * weight_sum)
         # 上限 1.0(summary 命中拉高时可能超 1.0,但分子仍被 100*weight_sum 限制)
         if score > 1.0:
             score = 1.0
@@ -1658,6 +2238,8 @@ class BucketManager:
         matched_in = []
         if name_raw >= self._MATCH_THRESHOLD: matched_in.append("title")
         if summary_raw >= self._MATCH_THRESHOLD: matched_in.append("summary")
+        if meaning_raw >= self._MATCH_THRESHOLD: matched_in.append("meaning")
+        if why_raw >= self._MATCH_THRESHOLD: matched_in.append("why")
         if domain_raw >= self._MATCH_THRESHOLD: matched_in.append("domain")
         if tag_raw >= self._MATCH_THRESHOLD: matched_in.append("tag")
         if content_raw >= self._MATCH_THRESHOLD: matched_in.append("content")
@@ -1668,6 +2250,8 @@ class BucketManager:
             "field_scores": {
                 "title": name_raw,
                 "summary": summary_raw,
+                "meaning": meaning_raw,
+                "why": why_raw,
                 "domain": domain_raw,
                 "tag": tag_raw,
                 "content": content_raw,
@@ -1731,8 +2315,49 @@ class BucketManager:
     def _invalidate_active_cache(self) -> None:
         """任何改变活跃桶集合/元数据的写操作后调用。(对齐上游 2.5.0 性能)"""
         self._active_cache = None
+        self._active_file_state = {}
+        self._last_file_state_check = 0.0
 
-    def _update_active_cache_entry(self, bucket_id: str, updates: dict) -> None:
+    def _refresh_cached_file_state(self, file_path: str) -> None:
+        """确认一次内部原地写入，避免被下一轮轮询误判成外部编辑。"""
+        if self._active_cache is None:
+            return
+        normalized = os.path.normcase(os.path.abspath(file_path))
+        try:
+            stat = os.stat(file_path)
+            self._active_file_state[normalized] = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self._active_file_state.pop(normalized, None)
+        self._last_file_state_check = time.monotonic()
+
+    def _scan_active_file_state(self) -> dict[str, tuple[int, int]]:
+        """轻量读取所有活跃 Markdown 的 path/mtime/size 指纹。"""
+        state = {}
+        for dir_path in (
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+        ):
+            if not os.path.exists(dir_path):
+                continue
+            for root, _, files in os.walk(dir_path):
+                for filename in files:
+                    if not filename.endswith(".md"):
+                        continue
+                    file_path = os.path.join(root, filename)
+                    try:
+                        stat = os.stat(file_path)
+                    except OSError:
+                        continue
+                    state[os.path.normcase(os.path.abspath(file_path))] = (
+                        stat.st_mtime_ns,
+                        stat.st_size,
+                    )
+        return state
+
+    def _update_active_cache_entry(self, bucket_id: str, updates: dict, file_path: str = "") -> None:
         """touch/时间涟漪就地更新缓存条目, 不清整表 — 否则每次 breath touch 都会
         把缓存打掉, 缓存形同虚设。(对齐上游 2.5.0)"""
         if self._active_cache is None:
@@ -1742,51 +2367,100 @@ class BucketManager:
                 meta = b.get("metadata")
                 if isinstance(meta, dict):
                     meta.update(updates)
+                if file_path:
+                    self._refresh_cached_file_state(file_path)
                 return
 
+    def _reconcile_external_embedding_changes(self, previous: list[dict], current: list[dict]) -> None:
+        """Mirror Obsidian/Git edits into the derived vector queue."""
+        if self.embedding_outbox is None:
+            return
+        old_by_id = {str(item.get("id") or ""): item for item in previous}
+        new_by_id = {str(item.get("id") or ""): item for item in current}
+        for bucket_id, bucket in new_by_id.items():
+            if not bucket_id:
+                continue
+            old = old_by_id.get(bucket_id)
+            if old is None or str(old.get("content") or "") != str(bucket.get("content") or ""):
+                self._queue_embedding(bucket_id, str(bucket.get("content") or ""))
+        for bucket_id in set(old_by_id) - set(new_by_id):
+            if bucket_id:
+                self._remove_embedding(bucket_id)
+
     async def list_all(self, include_archive: bool = False) -> list[dict]:
+        """
+        列出所有记忆桶，并按当前 ACCESS_LEVEL 过滤。
+
+        活跃集缓存里存的是【不分级的全量】(见 _list_all_unfiltered)，分级滤网统一在这里跑，
+        覆盖缓存命中、指纹未变、重建、含归档等每一条返回路径。否则 ACCESS_LEVEL=2 填的缓存
+        会被受限通道(ACCESS_LEVEL=1)直接读到 level-2 私密桶。
+        """
+        return _filter_by_access_level(await self._list_all_unfiltered(include_archive=include_archive))
+
+    async def _list_all_unfiltered(self, include_archive: bool = False) -> list[dict]:
         """
         Recursively walk directories (including domain subdirs), list all buckets.
         递归遍历目录（含域子目录），列出所有记忆桶。
 
-        活跃集(include_archive=False)走内存缓存: 命中直接返回浅拷贝(调用方
-        sort/filter 不影响缓存, 但 dict 共享 — touch 就地更新对外可见, 有意)。
+        活跃集(include_archive=False)走内存缓存，并定期检查 Markdown 文件指纹；
+        只有 path/mtime/size 变化时才重新解析。
         """
-        if not include_archive:
-            if (self._active_cache is not None
-                    and (time.monotonic() - self._active_cache_at) < self._ACTIVE_CACHE_TTL_S):
-                # 逐桶拷贝(dict 一层 + metadata 一层): search() 会往结果上盖
-                # score/matched_in 等每查询字段, 共享 dict 会把这些污染进缓存。
-                # content 字符串不可变, 共享无害。
-                return _filter_by_access_level(
-                    [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
-                )
-
-        buckets = []
-
-        dirs = [self.permanent_dir, self.dynamic_dir, self.feel_dir]
+        dirs = [
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+        ]
         if include_archive:
             dirs.append(self.archive_dir)
 
-        for dir_path in dirs:
-            if not os.path.exists(dir_path):
-                continue
-            for root, _, files in os.walk(dir_path):
-                for filename in files:
-                    if not filename.endswith(".md"):
-                        continue
-                    file_path = os.path.join(root, filename)
-                    bucket = self._load_bucket(file_path)
-                    if bucket:
-                        buckets.append(bucket)
+        if include_archive:
+            buckets = []
+            for dir_path in dirs:
+                if not os.path.exists(dir_path):
+                    continue
+                for root, _, files in os.walk(dir_path):
+                    for filename in files:
+                        if filename.endswith(".md"):
+                            bucket = self._load_bucket(os.path.join(root, filename))
+                            if bucket:
+                                buckets.append(bucket)
+            return buckets
 
-        # 缓存里存【不分级的全量】, 分级滤网在每条返回路径上单独跑。
-        # 否则 ACCESS_LEVEL=2 填的缓存会被受限通道(ACCESS_LEVEL=1)直接读到 level-2 私密桶。
-        if not include_archive:
+        async with self._active_cache_lock:
+            now = time.monotonic()
+            previous_cache = list(self._active_cache) if self._active_cache is not None else None
+            if self._active_cache is not None:
+                poll_due = (
+                    self.external_change_poll_seconds == 0
+                    or now - self._last_file_state_check >= self.external_change_poll_seconds
+                )
+                if not poll_due:
+                    return [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
+                current_state = self._scan_active_file_state()
+                self._last_file_state_check = now
+                if current_state == self._active_file_state:
+                    return [{**b, "metadata": dict(b.get("metadata") or {})} for b in self._active_cache]
+                logger.info("External Markdown changes detected; rebuilding active bucket cache")
+
+            buckets = []
+            for dir_path in dirs:
+                if not os.path.exists(dir_path):
+                    continue
+                for root, _, files in os.walk(dir_path):
+                    for filename in files:
+                        if filename.endswith(".md"):
+                            bucket = self._load_bucket(os.path.join(root, filename))
+                            if bucket:
+                                buckets.append(bucket)
+
             self._active_cache = list(buckets)
-            self._active_cache_at = time.monotonic()
-
-        return _filter_by_access_level(buckets)
+            self._active_file_state = self._scan_active_file_state()
+            self._last_file_state_check = time.monotonic()
+            if previous_cache is not None:
+                self._reconcile_external_embedding_changes(previous_cache, buckets)
+            return buckets
 
     # ---------------------------------------------------------
     # Statistics (counts per category + total size)
@@ -1802,6 +2476,9 @@ class BucketManager:
             "dynamic_count": 0,
             "archive_count": 0,
             "feel_count": 0,
+            "plan_count": 0,
+            "letter_count": 0,
+            "identity_count": 0,
             "total_size_kb": 0.0,
             "domains": {},
         }
@@ -1811,6 +2488,8 @@ class BucketManager:
             (self.dynamic_dir, "dynamic_count"),
             (self.archive_dir, "archive_count"),
             (self.feel_dir, "feel_count"),
+            (self.plan_dir, "plan_count"),
+            (self.letter_dir, "letter_count"),
         ]:
             if not os.path.exists(subdir):
                 continue
@@ -1823,6 +2502,12 @@ class BucketManager:
                             stats["total_size_kb"] += os.path.getsize(fpath) / 1024
                         except OSError:
                             pass
+                        if subdir == self.dynamic_dir:
+                            try:
+                                if frontmatter.load(fpath).get("type") == "i":
+                                    stats["identity_count"] += 1
+                            except Exception:
+                                pass
                         # Per-domain counts / 每个域的桶数量
                         domain_name = os.path.basename(root)
                         if domain_name != os.path.basename(subdir):
@@ -1837,6 +2522,10 @@ class BucketManager:
     # 由衰减引擎调用，模拟"遗忘"
     # ---------------------------------------------------------
     async def archive(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._archive_locked(bucket_id)
+
+    async def _archive_locked(self, bucket_id: str) -> bool:
         """
         Move a bucket into the archive directory (preserving domain subdirs).
         将指定桶移入归档目录（保留域子目录结构）。
@@ -1879,6 +2568,10 @@ class BucketManager:
     # 用户在 dashboard 误归档/想恢复活跃时调用
     # ---------------------------------------------------------
     async def unarchive(self, bucket_id: str) -> bool:
+        async with self._bucket_turn(bucket_id):
+            return await self._unarchive_locked(bucket_id)
+
+    async def _unarchive_locked(self, bucket_id: str) -> bool:
         """Move an archived bucket back into dynamic/, clear 'archived' type marker."""
         file_path = self._find_bucket_file(bucket_id)
         if not file_path:
@@ -1929,7 +2622,15 @@ class BucketManager:
         """
         if not bucket_id:
             return None
-        dirs = [self.permanent_dir, self.dynamic_dir, self.archive_dir, self.feel_dir, self.trash_dir]
+        dirs = [
+            self.permanent_dir,
+            self.dynamic_dir,
+            self.archive_dir,
+            self.feel_dir,
+            self.plan_dir,
+            self.letter_dir,
+            self.trash_dir,
+        ]
         # --- Fast path: filename match ---
         for dir_path in dirs:
             if not os.path.exists(dir_path):
