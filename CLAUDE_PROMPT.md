@@ -56,6 +56,8 @@
 ### trace 的参数技巧
 - `resolved=1`：标记已解决，桶权重骤降到 5%，沉底等待关键词激活
 - `resolved=1` + 已消化（写过 feel）：权重骤降到 2%，加速淡化直到归档为无限小
+- `unlink="目标id"`：记忆下方出现 `↳ 相关 → xxx` 这样的关系提示，是系统自动发现的关联。连错了就用 `trace(bucket_id, unlink="xxx")` 双向断开
+- `relink="目标id", relation_type="..."`：关系连对了但类型不对时修改（caused_by 原因 / causes 结果 / continuation_of 前段 / continues 后续 / related_to 相关 / same_event 同一事件）。只能改已有的关系，不能凭空建立
 - `reinforce=True`：强化这条记忆。**检索是只读的**，搜到不会让记忆变重；读完之后确认它确实要紧，再单独调一次 `trace(bucket_id, reinforce=True)`。不能和其他修改一起传
 - `resolved=0`：重新激活，让它重新参与浮现排序
 - `delete=True`：彻底删除这个桶（不可恢复）

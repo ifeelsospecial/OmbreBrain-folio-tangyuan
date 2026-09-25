@@ -2,6 +2,15 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-09-26 · 桶间关系（对齐上游 3.2.0 / 3.3.0）
+
+- **自动建立关系**：hold / grow / capture-hook 新建记忆后，后台用向量相似度 + 时间差推断关系并双向写入 `relation_links`（规则原样移植自上游 `relation_store.py`：same_event ≥0.85 且 ≤6 小时、continuation_of ≥0.75 且 ≤72 小时、related_to ≥0.72；每桶最多 8 条自动关系；因果与 custom 永不自动建）。不调 LLM；fire-and-forget，失败只记日志，不影响写入。feel / plan / letter / I 不参与。只对之后新建的记忆生效，存量记忆不补建。
+- **关系提示**：breath 浮现（核心准则 / 永久参考 / 浮现记忆）、检索结果和 dream 里，记忆下方显示 `↳ 相关 → <id>`（最多 2 条，多的折叠）。只显示目标在当前视野内（活跃、未删除、分级可见）的关系。
+- **trace 修正关系**：`unlink="目标id"` 双向物理移除；`relink="目标id", relation_type=...` 改已有关系类型，对侧自动写反向类型，改过的降为手动关系、不再被自动推断改写。不能凭空建立；与其他修改互斥；参数不合法抛工具错误而不是返回像成功的短句。
+- **`BucketManager.mutate_relation_pair()`**：按 id 排序持有两把跨进程桶锁，第二个写失败时恢复第一个。
+- **核心准则不可被消化**（对齐上游 3.2.0 修复）：钉选 / 高亮 / 保护的桶不再因带 internalized（digested）标记从 breath 与 breath-hook 的核心准则 / 永久参考区消失。线上数据中目前没有这种桶，不会有记忆突然冒出。
+- 测试：新增 `tests/test_relations.py`（6 例）；已验证去掉可见性过滤、去掉新建后连关系、恢复"已内化即隐藏"时对应用例失败。全量 143 passed, 7 skipped。
+
 ## 2026-09-26 · 检索与浮现（对齐上游 3.6.0 / 3.0.0）
 
 - **检索只读**：`breath_search` / `breath_advanced` 的命中不再后台 `touch()`。此前每条命中都刷新 `last_active`、`activation_count += 1` 并触发时间涟漪，形成"查得勤 == 更重要"：为核对事实反复读的旧记忆权重越爬越高，新桶挤不进浮现区。recall-hook / breath-hook 本来就只记命中统计、不改权重，行为不变。
