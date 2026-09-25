@@ -12,11 +12,175 @@
 import os
 import re
 import json
+import time
 import uuid
 import yaml
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, date, timezone
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """原子写文本: 写临时文件 → fsync → os.replace 就位。(对齐上游 2.5.0 记忆安全)
+
+    记忆桶是最不能丢的东西。普通 open("w") 写到一半被杀/断电/磁盘写满, 会把文件
+    截断成半截甚至清空。这里保证任何读者或崩溃恢复只会看到「旧的完整版」或
+    「新的完整版」, 绝不出现半截文件。os.replace 在同一文件系统上是原子替换
+    (POSIX + Windows 均是)。临时名带 uuid: 并发写同一文件也不会撞同一个 .tmp。
+
+    Windows: OneDrive/杀软/索引器可能短暂持有目标文件, 让 replace 报
+    PermissionError(截断式写入反而能过) — 短重试 3 次, 仍失败则抛错。
+    绝不回退成截断式写入: 报错可重试, 半截文件才是不可挽回的。
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(3):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.05)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def sideline_stale_dest(dest: str) -> None:
+    """移动/归档目标已存在同名文件时, 把旧文件旁置为 <name>.stale-<ts>。(对齐上游 2.5.0 防撞名)
+
+    同名只可能是历史崩溃/rename 失败留下的同一桶陈旧副本(文件名含桶 id, 不同桶不会同名)。
+    直接 shutil.move 的行为不可控: POSIX 静默覆盖(陈旧副本可能含新副本没有的内容), Windows
+    直接抛错。旁置后缀不以 .md 结尾 → 所有桶扫描(_find_bucket_file/list_all)自动忽略,
+    既不丢字节也不产生重复 id。
+    """
+    if not os.path.exists(dest):
+        return
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+    stale = f"{dest}.stale-{ts}"
+    if os.path.exists(stale):
+        stale = f"{dest}.stale-{ts}-{uuid.uuid4().hex[:6]}"
+    os.replace(dest, stale)
+    logging.getLogger("ombre_brain.utils").warning(
+        f"移动目标已存在同名文件, 旧副本已旁置 / sidelined stale duplicate: {stale}"
+    )
+
+
+def positive_float(value, default: float) -> float:
+    """把 config/env 里的数值安全归一成正浮点; 非法/非正值回退 default。(对齐上游 2.4.5)"""
+    try:
+        f = float(value)
+        return f if f > 0 else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+_BOOL_TRUE = {"1", "true", "yes", "on"}
+_BOOL_FALSE = {"0", "false", "no", "off", ""}
+
+
+def coerce_bool(value, default: bool = False) -> bool:
+    """把 config/env 里的布尔值安全归一。(对齐上游 2.5.3)
+
+    YAML/JSON 里写成带引号的 "false"/"0" 会被解析成字符串, bool("false") == True
+    静默把开关误开。认不出的字符串按 default 处理。
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in _BOOL_TRUE:
+            return True
+        if s in _BOOL_FALSE:
+            return False
+        return default
+    return bool(value)
+
+
+def clean_llm_json(raw: str) -> str:
+    """从 LLM 回复中抠出完整 JSON 值。(对齐上游 2.4.6, 提取策略有意比上游严)
+
+    模型(尤其 DeepSeek)偶尔在 JSON 前后附带说明文字或 Markdown 围栏。
+    整体可直接 parse 时原样返回; 否则扫描平衡的数组/对象取**最后一个**——
+    说明文字里的格式示例(如「请按 {"k": 0.5} 的格式」)通常出现在真实结果之前,
+    上游取第一个会把示例当结果吞进去。找不到平衡值时原样返回,
+    让调用方的 json.loads 照常报错走既有兜底。
+    """
+    cleaned = (raw or "").strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    try:
+        json.loads(cleaned)
+        return cleaned
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    last = None
+    idx = 0
+    while idx < len(cleaned):
+        if cleaned[idx] not in "[{":
+            idx += 1
+            continue
+        try:
+            _value, end = decoder.raw_decode(cleaned[idx:])
+        except json.JSONDecodeError:
+            idx += 1
+            continue
+        last = cleaned[idx:idx + end].strip()
+        idx += end
+    return last if last is not None else cleaned
+
+
+def parse_iso_datetime(value) -> datetime:
+    """把任意时间元数据(ISO 字符串/带 Z 或 offset/datetime/date 对象)解析成 naive UTC datetime。
+    (对齐上游 2.5.3 时区统一)
+
+    本仓写侧一律 UTC(now_iso() 带 Z 后缀; 旧代码 utcnow() 无 Z), 但读侧曾直接
+    fromisoformat: 带 Z 的字符串在 py3.11+ 解析成 offset-aware, 和 naive 的
+    now()/utcnow() 相减直接 TypeError → 各处 except 兜底把桶一律当"30 天前",
+    衰减和检索新鲜度分全部失真。统一从这里解析: aware → 转 UTC 去 tzinfo;
+    naive 字符串按 UTC 对待(与写侧一致; 上游迁移来的本地时间戳最多差一个时区,
+    对天级衰减可忽略)。解析失败抛 ValueError/TypeError, 兜底由调用方决定。
+    """
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("empty datetime")
+        if raw[-1:] in ("z", "Z"):
+            raw = raw[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def days_since_iso(value, fallback_days: float = 30.0) -> float:
+    """解析时间元数据, 返回"距现在多少天"(≥0 浮点)。解析失败返回 fallback_days。
+    比较基准 utcnow(与存储侧 UTC 一致), 不再用本地 now() 引入时区偏移。"""
+    try:
+        t = parse_iso_datetime(value)
+        return max(0.0, (datetime.utcnow() - t).total_seconds() / 86400.0)
+    except (ValueError, TypeError):
+        return float(fallback_days)
 
 
 def load_config(config_path: str = None) -> dict:
@@ -103,6 +267,10 @@ def load_config(config_path: str = None) -> dict:
     env_embed_base = os.environ.get("OMBRE_EMBED_BASE_URL", "")
     if env_embed_base:
         config.setdefault("embedding", {})["base_url"] = env_embed_base
+    # embedding 模型名独立可配 — 让"换 embedding 供应商"真正等于改 env + 跑一次 backfill
+    env_embed_model = os.environ.get("OMBRE_EMBED_MODEL", "")
+    if env_embed_model:
+        config.setdefault("embedding", {})["model"] = env_embed_model
 
     env_transport = os.environ.get("OMBRE_TRANSPORT", "")
     if env_transport:
@@ -141,7 +309,8 @@ def load_config(config_path: str = None) -> dict:
             if strategy.get("merge_threshold") is not None:
                 config["merge_threshold"] = int(strategy["merge_threshold"])
             if strategy.get("auto_merge") is not None:
-                config["auto_merge"] = bool(strategy["auto_merge"])
+                # coerce_bool: 手编 runtime_config.json 写成 "false" 字符串也不误开
+                config["auto_merge"] = coerce_bool(strategy["auto_merge"], default=True)
             if strategy.get("max_recall") is not None:
                 config.setdefault("matching", {})["max_results"] = int(strategy["max_recall"])
     except Exception:
@@ -242,10 +411,11 @@ def normalize_event_time(s):
         if not s:
             return None
     try:
-        from datetime import datetime as _dt, date as _date
-        if hasattr(s, "isoformat"):  # datetime / date
-            return s.isoformat()
-        return _dt.fromisoformat(str(s)).isoformat()
+        if isinstance(s, date) and not isinstance(s, datetime):
+            return s.isoformat()  # 纯日期对象保持 YYYY-MM-DD 短格式
+        # datetime 对象或字符串: 统一走 parse_iso_datetime(naive UTC),
+        # 防带 Z/offset 的输入把 "+00:00" 混进存储(对齐上游 2.5.3)
+        return parse_iso_datetime(s).isoformat()
     except (ValueError, TypeError):
         return None
 

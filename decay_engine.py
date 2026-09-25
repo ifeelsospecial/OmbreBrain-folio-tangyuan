@@ -22,9 +22,7 @@
 import math
 import asyncio
 import logging
-from datetime import datetime
-
-from utils import is_internalized, is_protected, is_highlighted
+from utils import is_internalized, is_protected, is_highlighted, days_since_iso
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -165,12 +163,10 @@ class DecayEngine:
         activation_count = max(1.0, float(metadata.get("activation_count") or 1))
 
         # --- Days since last activation ---
+        # 对齐上游 2.5.3: 带 Z/offset 的时间戳曾在这里抛 TypeError → 全部兜底成"30 天前",
+        # 衰减对所有桶失真。统一走 utils.days_since_iso(naive UTC 口径)。
         last_active_str = metadata.get("last_active", metadata.get("created", ""))
-        try:
-            last_active = datetime.fromisoformat(str(last_active_str))
-            days_since = max(0.0, (datetime.now() - last_active).total_seconds() / 86400)
-        except (ValueError, TypeError):
-            days_since = 30
+        days_since = days_since_iso(last_active_str, fallback_days=30)
 
         # --- Emotion weight ---
         try:
