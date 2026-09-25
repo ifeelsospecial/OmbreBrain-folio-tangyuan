@@ -408,6 +408,20 @@ async def breath_hook(request):
         except Exception:
             pass
 
+        # 快到的约定放最前(最该先想起), 一个月/一年前的今天放最后; 都不进权重池
+        try:
+            for due, delta, pb in reversed(_upcoming_plans(all_buckets)):
+                parts.insert(0, f"📅 约好的事 · {due.isoformat()}（{_due_phrase(delta)}）：{strip_wikilinks(pb.get('content', ''))}")
+            for title, db in _on_this_day(all_buckets, exclude_ids=set(surfaced_ids)):
+                try:
+                    day_summary = await dehydrator.dehydrate(
+                        strip_wikilinks(db["content"]), {k: v for k, v in db["metadata"].items() if k != "tags"})
+                except Exception:
+                    day_summary = strip_wikilinks(db.get("content", ""))[:300]
+                parts.append(f"🕰 {title}：{day_summary}")
+        except Exception as e:
+            logger.warning(f"breath-hook extra sections failed: {e}")
+
         if not parts:
             return PlainTextResponse("")
         return PlainTextResponse("[Ombre Brain - 记忆浮现]\n" + "\n---\n".join(parts))
@@ -878,6 +892,98 @@ def _schedule_relation_link(bucket_id: str, content: str) -> None:
 # 读不出时间的桶在给了范围时【排除】而非放行: 调用方明说"只要这段时间的", 静默多给等于破坏约定。
 # 核心准则/永久参考不受时间过滤: 它们是准则, 不是那段时间里发生的事(有意的不对称)。
 # ---------------------------------------------------------------
+# ---------------------------------------------------------------
+# 开场浮现的两个小段(本 fork 定制): 「一个月 / 一年前的今天」与「快到的约定」
+# 都是在权重池之外追加的独立段, 不进权重打分, 也不占普通浮现的名额。
+# ---------------------------------------------------------------
+_ON_THIS_DAY_EXCLUDED = ("feel", "plan", "letter", "i", "trashed", "archived")
+
+
+def _bucket_day(meta: dict):
+    """事件日优先(event_time), 没有才用创建日。返回 date 或 None。"""
+    from utils import parse_iso_datetime as _parse
+    for key in ("event_time", "created"):
+        raw = (meta or {}).get(key)
+        if raw:
+            try:
+                return _parse(raw).date()
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _shift_months(day, months: int):
+    """同一天往前挪 N 个月; 目标月没有这一天(31 号)时取该月最后一天。"""
+    import calendar
+    from datetime import date as _date
+    total = day.year * 12 + (day.month - 1) - months
+    year, month = divmod(total, 12)
+    month += 1
+    return _date(year, month, min(day.day, calendar.monthrange(year, month)[1]))
+
+
+def _on_this_day(all_buckets: list, today=None, exclude_ids: set | None = None) -> list:
+    """返回 [(标题, 桶)], 最多一年前、一个月前各一条; 同一天多条时挑重要度×情绪强度最高的。"""
+    from datetime import datetime as _dt
+    surf = (config.get("surfacing") or {}) if isinstance(config, dict) else {}
+    if not coerce_bool(surf.get("on_this_day", True), default=True):
+        return []
+    today = today or _dt.utcnow().date()
+    exclude_ids = exclude_ids or set()
+    picks = []
+    for months, title in ((12, "一年前的今天"), (1, "一个月前的今天")):
+        target = _shift_months(today, months)
+        same_day = []
+        for b in all_buckets:
+            meta = b.get("metadata") or {}
+            if (meta.get("type") in _ON_THIS_DAY_EXCLUDED or b["id"] in exclude_ids
+                    or is_internalized(meta) or meta.get("dont_surface") or _is_noise_meta(meta)):
+                continue
+            if _bucket_day(meta) == target:
+                same_day.append(b)
+        if same_day:
+            def _weight(b):
+                m = b.get("metadata") or {}
+                try:
+                    return int(m.get("importance") or 5) * (0.5 + float(m.get("arousal") or 0.3))
+                except (TypeError, ValueError):
+                    return 0
+            best = max(same_day, key=_weight)
+            picks.append((f"{title}（{target.isoformat()}）", best))
+            exclude_ids = exclude_ids | {best["id"]}
+    return picks
+
+
+def _upcoming_plans(all_buckets: list, today=None, ahead_days: int = 3, overdue_days: int = 7) -> list:
+    """进行中且带约定日期的 plan: 未来 ahead_days 天内到期, 或已过期但不超过 overdue_days 天。按日期排序。"""
+    from datetime import datetime as _dt, date as _date
+    today = today or _dt.utcnow().date()
+    rows = []
+    for b in all_buckets:
+        meta = b.get("metadata") or {}
+        if meta.get("type") != "plan" or str(meta.get("status") or "active").lower() != "active":
+            continue
+        try:
+            due = _date.fromisoformat(str(meta.get("due") or "")[:10])
+        except ValueError:
+            continue
+        delta = (due - today).days
+        if -overdue_days <= delta <= ahead_days:
+            rows.append((due, delta, b))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+def _due_phrase(delta: int) -> str:
+    if delta == 0:
+        return "就是今天"
+    if delta == 1:
+        return "明天"
+    if delta > 1:
+        return f"{delta} 天后"
+    return f"已经过了 {-delta} 天，还没做"
+
+
 def _relations_for_api(meta: dict) -> list:
     """把 relation_links 精简成前端用的 [{target, type, label}]; 数据写坏就返回空, 不让列表接口失败。"""
     try:
@@ -1148,8 +1254,9 @@ async def _breath_impl(
         results = []
         for b in plans:
             meta = b.get("metadata") or {}
+            due_tag = f" [约在:{meta.get('due')}]" if meta.get("due") else ""
             entry = (f"[{str(meta.get('created', ''))[:10]}] [bucket_id:{b['id']}] "
-                     f"[weight:{meta.get('weight', '?')}]\n{strip_wikilinks(b.get('content', ''))}")
+                     f"[weight:{meta.get('weight', '?')}]{due_tag}\n{strip_wikilinks(b.get('content', ''))}")
             if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
                 break
             results.append(entry)
@@ -1341,16 +1448,36 @@ async def _breath_impl(
         except Exception:
             pass
 
-        if not pinned_results and not protected_results and not dynamic_results:
+        # --- 快到的约定 + 一个月/一年前的今天(独立段, 不进权重池) ---
+        plan_lines = []
+        if not date_filtered:
+            for due, delta, pb in _upcoming_plans(all_buckets):
+                plan_lines.append(f"📅 {due.isoformat()}（{_due_phrase(delta)}）[bucket_id:{pb['id']}] "
+                                  f"{strip_wikilinks(pb.get('content', ''))}")
+        day_lines = []
+        if not date_filtered:
+            for title, db in _on_this_day(all_buckets, exclude_ids=set(surfaced_ids)):
+                try:
+                    clean_meta = {k: v for k, v in db["metadata"].items() if k != "tags"}
+                    summary = await dehydrator.dehydrate(strip_wikilinks(db["content"]), clean_meta)
+                except Exception:
+                    summary = strip_wikilinks(db.get("content", ""))[:300]
+                day_lines.append(f"🕰 {title} [bucket_id:{db['id']}] {summary}")
+
+        if not pinned_results and not protected_results and not dynamic_results and not plan_lines and not day_lines:
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
+        if plan_lines:
+            parts.append("=== 快到的约定 ===\n" + "\n".join(plan_lines))
         if pinned_results:
             parts.append("=== 核心准则 ===\n" + "\n---\n".join(pinned_results))
         if protected_results:
             parts.append("=== 永久参考 ===\n" + "\n---\n".join(protected_results))
         if dynamic_results:
             parts.append("=== 浮现记忆 ===\n" + "\n---\n".join(dynamic_results))
+        if day_lines:
+            parts.append("=== 那天 ===\n" + "\n---\n".join(day_lines))
         return "\n\n".join(parts)
 
     # --- With args: search mode (keyword + vector dual channel) ---
@@ -2064,8 +2191,9 @@ async def trace(
     relink: str = "",
     relation_type: str = "",
     quotes_replace: list | None = None,
+    due: str | None = None,
 ) -> str:
-    """修改记忆元数据或内容。quotes_replace=[...]=订正或删除这条记忆的引语(整体替换;传[]删除全部;只删一句就把要保留的原样传回;只能改和删,不能补录,条数只能持平或减少);unlink="目标id"=双向解除这条记忆与目标之间自动连错的关系;relink="目标id"+relation_type=修改已有关系的类型(caused_by/causes/continuation_of/continues/related_to/same_event,只能改已有的,不能凭空建立,改过的不再被自动推断改写);reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索;钉选/高亮/保护的桶不受影响,想隐藏先取消钉选)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。due=改 plan 的约定日期(YYYY-MM-DD,空字符串=去掉日期);quotes_replace=[...]=订正或删除这条记忆的引语(整体替换;传[]删除全部;只删一句就把要保留的原样传回;只能改和删,不能补录,条数只能持平或减少);unlink="目标id"=双向解除这条记忆与目标之间自动连错的关系;relink="目标id"+relation_type=修改已有关系的类型(caused_by/causes/continuation_of/continues/related_to/same_event,只能改已有的,不能凭空建立,改过的不再被自动推断改写);reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索;钉选/高亮/保护的桶不受影响,想隐藏先取消钉选)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -2093,7 +2221,7 @@ async def trace(
                 ("content", content, ""), ("delete", delete, False), ("hard_delete", hard_delete, False),
                 ("reinforce", reinforce, False), ("status", status, ""), ("weight", weight, -1),
                 ("why_remembered", why_remembered, ""), ("meaning_append", meaning_append, ""),
-                ("quotes_replace", quotes_replace, None),
+                ("quotes_replace", quotes_replace, None), ("due", due, None),
             ) if v != d
         ]
         if _other:
@@ -2112,7 +2240,7 @@ async def trace(
                 ("internalized", internalized, -1), ("event_time", event_time, ""), ("content", content, ""),
                 ("delete", delete, False), ("hard_delete", hard_delete, False), ("reinforce", reinforce, False),
                 ("status", status, ""), ("weight", weight, -1), ("why_remembered", why_remembered, ""),
-                ("meaning_append", meaning_append, ""),
+                ("meaning_append", meaning_append, ""), ("due", due, None),
             ) if v != d
         ]
         if _other:
@@ -2150,6 +2278,7 @@ async def trace(
                 ("dont_surface", dont_surface, -1), ("media_replace", media_replace, None),
                 ("hard_delete", hard_delete, False), ("unlink", unlink, ""), ("relink", relink, ""),
                 ("relation_type", relation_type, ""), ("quotes_replace", quotes_replace, None),
+                ("due", due, None),
             ) if value != default
         ]
         if _other_changes:
@@ -2244,6 +2373,13 @@ async def trace(
         updates["status"] = normalized_status
     if isinstance(weight, (int, float)) and not isinstance(weight, bool) and 0 <= weight <= 1:
         updates["weight"] = float(weight)
+    if due is not None:
+        if (bucket.get("metadata") or {}).get("type") != "plan":
+            return "due 只能用于 plan。"
+        try:
+            updates["due"] = _normalize_due(due)
+        except ValueError as e:
+            return str(e)
     if dont_surface in (0, 1):
         updates["dont_surface"] = bool(dont_surface)
     if media_replace is not None:
@@ -2372,6 +2508,18 @@ async def _trace_relation_edit(bucket_id: str, unlink: str, relink: str, relatio
             "并标记为手动关系，不会再被自动推断改写。")
 
 
+def _normalize_due(value) -> str:
+    """plan 的约定日期: 只收 YYYY-MM-DD(或带时间的 ISO, 取日期部分); 空 = 没有日期。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    from datetime import date as _date
+    try:
+        return _date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        raise ValueError(f"due 日期格式不对: {text}（用 YYYY-MM-DD，比如 2026-10-03）")
+
+
 def _append_plan_change_log(old_history, action: str, **fields) -> list:
     from datetime import datetime as _dt
     history = list(old_history or [])
@@ -2484,9 +2632,14 @@ async def plan(
     related_bucket: str = "",
     weight: float = 0.5,
     why_remembered: str = "",
+    due: str = "",
 ) -> str:
-    """登记待办、承诺或未闭环事项；weight 0~1 表示它压在心头的重量。"""
+    """登记待办、承诺或未闭环事项；weight 0~1 表示它压在心头的重量。due=约好的日子(YYYY-MM-DD, 可选)：快到或过了还没做时，开场 breath 会主动提起。"""
     text = str(content or "").strip()
+    try:
+        due_value = _normalize_due(due)
+    except ValueError as e:
+        return str(e)
     if not text:
         return "内容为空，无法登记计划。"
     size_error = _payload_size_error("计划", text, "max_bucket_bytes", 50 * 1024)
@@ -2524,9 +2677,11 @@ async def plan(
     }
     if str(related_bucket or "").strip():
         updates["related_bucket"] = str(related_bucket).strip()
+    if due_value:
+        updates["due"] = due_value
     await bucket_mgr.update(bucket_id, **updates)
     _invalidate_buckets_cache()
-    return f"📋plan→{bucket_id} [{normalized_status}]"
+    return f"📋plan→{bucket_id} [{normalized_status}]" + (f" 约在 {due_value}" if due_value else "")
 
 
 def _ai_name() -> str:

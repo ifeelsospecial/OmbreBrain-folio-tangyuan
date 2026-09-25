@@ -1353,6 +1353,7 @@ class BucketManager:
             ("aspect", 32),
             ("resolution_reason", 500),
             ("resolved_by", 128),
+            ("due", 32),
         ):
             if text_key in kwargs:
                 value = str(kwargs[text_key] or "").strip()[:limit]

@@ -68,3 +68,78 @@ def test_raw_source_append_and_cap():
     long = server._append_raw_source("旧" * 7000, "新" * 3000)
     assert len(long) <= server._RAW_SOURCE_CAP
     assert long.startswith("（更早的原文已省略）") and long.endswith("新" * 3000)
+
+
+# ---- 一个月 / 一年前的今天 + 约定日期 ----
+from datetime import date, datetime, timedelta
+
+
+def test_shift_months_edges():
+    import server
+    assert server._shift_months(date(2026, 3, 31), 1) == date(2026, 2, 28)
+    assert server._shift_months(date(2026, 1, 15), 1) == date(2025, 12, 15)
+    assert server._shift_months(date(2026, 9, 26), 12) == date(2025, 9, 26)
+
+
+@pytest.mark.asyncio
+async def test_on_this_day_prefers_event_time_and_weight(srv, monkeypatch):
+    server, bm = srv
+    today = datetime.utcnow().date()
+    month_ago = server._shift_months(today, 1).isoformat()
+    small = await bm.create(content="一个月前的小事", importance=3, event_time=month_ago)
+    big = await bm.create(content="一个月前的大事", importance=9, arousal=0.8, event_time=month_ago)
+    await bm.update(big, resolved=True)   # 已沉底的事在"那天"仍会被想起; 也避免它先出现在普通浮现里
+    await bm.create(content="一个月前的 feel", bucket_type="feel", event_time=month_ago)
+    await bm.create(content="昨天的事", event_time=(today - timedelta(days=1)).isoformat())
+    picks = server._on_this_day(await bm.list_all())
+    assert [b["id"] for _, b in picks] == [big]
+    assert "一个月前的今天" in picks[0][0]
+    out = await server.breath()
+    assert "=== 那天 ===" in out and "一个月前的大事" in out
+    monkeypatch.setitem(server.config, "surfacing", {"on_this_day": False})
+    assert server._on_this_day(await bm.list_all()) == []
+
+
+@pytest.mark.asyncio
+async def test_plan_due_surfaces_when_close(srv):
+    server, bm = srv
+    today = datetime.utcnow().date()
+    assert "格式不对" in await server.plan(content="坏日期", due="下周六")
+    await server.plan(content="陪她去看展", due=(today + timedelta(days=1)).isoformat())
+    await server.plan(content="很久以后的事", due=(today + timedelta(days=30)).isoformat())
+    await server.plan(content="早就过期的事", due=(today - timedelta(days=10)).isoformat())
+    await server.plan(content="没日期的事")
+    out = await server.breath()
+    assert "=== 快到的约定 ===" in out
+    assert "陪她去看展" in out and "明天" in out
+    assert "很久以后的事" not in out and "早就过期的事" not in out and "没日期的事" not in out
+    plan_out = await server.breath_advanced(domain="plan")
+    assert "[约在:" in plan_out
+
+
+@pytest.mark.asyncio
+async def test_trace_can_move_or_clear_due_on_plans_only(srv):
+    server, bm = srv
+    today = datetime.utcnow().date()
+    await server.plan(content="改期的约定", due=(today + timedelta(days=20)).isoformat())
+    pid = [b["id"] for b in await bm.list_all() if b["metadata"].get("type") == "plan"][0]
+    await server.trace(bucket_id=pid, due=today.isoformat())
+    assert (await bm.get(pid))["metadata"]["due"] == today.isoformat()
+    assert "就是今天" in await server.breath()
+    await server.trace(bucket_id=pid, due="")
+    assert "due" not in (await bm.get(pid))["metadata"]
+    normal = await bm.create(content="普通记忆")
+    assert "只能用于 plan" in await server.trace(bucket_id=normal, due=today.isoformat())
+
+
+@pytest.mark.asyncio
+async def test_breath_hook_carries_plans_and_that_day(srv):
+    server, bm = srv
+    today = datetime.utcnow().date()
+    await server.plan(content="周末去海边", due=today.isoformat())
+    yb = await bm.create(content="一年前的今天她在爱丁堡", event_time=server._shift_months(today, 12).isoformat())
+    await bm.update(yb, resolved=True)
+    resp = await server.breath_hook(_Req({}))
+    text = resp.body.decode()
+    assert text.index("📅 约好的事") < text.index("🕰 一年前的今天")
+    assert "周末去海边" in text and "爱丁堡" in text
