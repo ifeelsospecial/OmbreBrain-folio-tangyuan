@@ -49,11 +49,11 @@ async def test_inference_thresholds_types_and_exclusions(srv):
     related = await bm.create(content="很久以前的伦敦")
     weak = await bm.create(content="无关")
     feel = await bm.create(content="一条 feel", bucket_type="feel")
-    vec.scores = {src: 1.0, same: 0.90, related: 0.73, weak: 0.60, feel: 0.99}
+    vec.scores = {src: 1.0, same: 0.95, related: 0.81, weak: 0.79, feel: 0.99}
     inferred = {l["target_bucket_id"]: l for l in await relation_link.infer_links_for(bm, vec, src, "她在伦敦面试")}
-    assert inferred[same]["type"] == "same_event"          # ≥0.85 且同一时间
+    assert inferred[same]["type"] == "same_event"          # ≥0.93(本 fork 校准) 且同一时间
     assert inferred[related]["type"] in ("related_to", "continuation_of", "same_event")
-    assert weak not in inferred                              # 低于 0.72
+    assert weak not in inferred                              # 低于 0.80(本 fork 校准)
     assert feel not in inferred and src not in inferred      # feel 不连; 不连自己
 
 
@@ -160,7 +160,7 @@ async def test_backfill_links_newer_to_older_once_and_is_idempotent(srv):
     _set_created(bm, old, "2026-07-01T10:00:00Z")
     _set_created(bm, new, "2026-07-02T10:00:00Z")   # 24 小时后
     _set_created(bm, far, "2026-06-01T10:00:00Z")
-    vec.scores = {old: 0.80, new: 0.80, far: 0.10}
+    vec.scores = {old: 0.85, new: 0.85, far: 0.10}
     progress = {}
     await relation_link.backfill_links(bm, vec, progress, pause_s=0)
     assert progress["total"] == 3 and progress["errors"] == 0 and progress["built"] == 1
@@ -178,11 +178,12 @@ async def test_backfill_endpoint_and_relations_in_bucket_api(srv, monkeypatch):
     server, bm, vec = srv
     a = await bm.create(content="A 事")
     b = await bm.create(content="B 事")
-    vec.scores = {a: 0.80, b: 0.80}
+    vec.scores = {a: 0.85, b: 0.85}
 
     class _Req:
         def __init__(self, method):
             self.method = method
+            self.query_params = {}
     monkeypatch.setattr(server, "_RELATION_BACKFILL", {"running": False})
     resp = await server.api_relations_backfill(_Req("POST"))
     assert resp.status_code == 202
@@ -193,3 +194,37 @@ async def test_backfill_endpoint_and_relations_in_bucket_api(srv, monkeypatch):
     rels = server._relations_for_api((await bm.get(a))["metadata"]) + server._relations_for_api((await bm.get(b))["metadata"])
     assert {r["target"] for r in rels} == {a, b} and all(r["label"] for r in rels)
     assert server._relations_for_api({"relation_links": "broken"}) == []
+
+
+
+# ---- 门槛校准 + 重建 ----
+
+def test_calibrated_defaults_and_config_override():
+    th = relation_link.resolve_thresholds(None)
+    assert th == {"related_min_score": 0.80, "continuation_min_score": 0.83, "same_event_min_score": 0.93}
+    assert relation_link.infer_type(0.79, 1, th) is None
+    assert relation_link.infer_type(0.80, 1000, th) == "related_to"
+    assert relation_link.infer_type(0.84, 24, th) == "continuation_of"
+    assert relation_link.infer_type(0.94, 2, th) == "same_event"
+    up = relation_link.resolve_thresholds({"related_min_score": 0.72, "continuation_min_score": 0.75,
+                                           "same_event_min_score": 0.85})
+    assert relation_link.infer_type(0.73, 1000, up) == "related_to"   # 上游原值仍可配置回去
+    assert relation_link.resolve_thresholds({"related_min_score": "oops"})["related_min_score"] == 0.80
+
+
+@pytest.mark.asyncio
+async def test_rebuild_clears_auto_keeps_manual(srv):
+    server, bm, vec = srv
+    a = await bm.create(content="甲")
+    b = await bm.create(content="乙")
+    c = await bm.create(content="丙")
+    vec.scores = {b: 0.81, c: 0.81}
+    await relation_link.link_new_bucket(bm, vec, a, "甲")
+    await server.trace(bucket_id=a, relink=c, relation_type="caused_by")     # a-c 变成手动关系
+    vec.scores = {}                                                         # 新门槛下谁都不再相关
+    progress = {}
+    await relation_link.backfill_links(bm, vec, progress, pause_s=0, rebuild=True)
+    assert progress["cleared"] >= 2
+    la, lb, lc = await _links(bm, a), await _links(bm, b), await _links(bm, c)
+    assert b not in la and a not in lb                                      # 自动关系清掉了
+    assert la[c]["type"] == "caused_by" and lc[a]["type"] == "causes"       # 手动关系保留

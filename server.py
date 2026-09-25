@@ -838,8 +838,9 @@ async def _merge_or_create(
 def _schedule_relation_link(bucket_id: str, content: str) -> None:
     """新建桶后后台推断桶间关系(对齐上游 3.2.0)。fire-and-forget: 失败只记日志, 不影响写入。"""
     try:
-        from relation_link import link_new_bucket
-        task = asyncio.create_task(link_new_bucket(bucket_mgr, embedding_engine, bucket_id, content))
+        from relation_link import link_new_bucket, resolve_thresholds
+        task = asyncio.create_task(link_new_bucket(bucket_mgr, embedding_engine, bucket_id, content,
+                                                   resolve_thresholds(config.get("relations"))))
         _BG_TASKS.add(task)
         task.add_done_callback(_BG_TASKS.discard)
     except Exception as e:  # 没有运行中的事件循环等极端情况
@@ -3283,19 +3284,22 @@ _RELATION_BACKFILL: dict = {"running": False, "processed": 0, "total": 0, "built
 
 @mcp.custom_route("/api/relations/backfill", methods=["GET", "POST"])
 async def api_relations_backfill(request):
-    """GET 查进度; POST 在后台启动一次存量关系回填(已在跑时直接返回进度)。仅管理员通道可达(/api/*)。"""
+    """GET 查进度; POST 在后台启动一次存量关系回填(已在跑时直接返回进度)。仅管理员通道可达(/api/*)。
+    POST ?rebuild=1: 先清掉所有自动关系(手动改过的保留)再按当前门槛重建——调过门槛后用。"""
     from starlette.responses import JSONResponse
     from datetime import datetime as _dt
     if request.method == "GET" or _RELATION_BACKFILL.get("running"):
         return JSONResponse(dict(_RELATION_BACKFILL))
 
-    from relation_link import backfill_links
+    from relation_link import backfill_links, resolve_thresholds
+    rebuild = request.query_params.get("rebuild", "").lower() in ("1", "true", "yes")
     _RELATION_BACKFILL.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z",
                                "finished_at": ""})
 
     async def _run():
         try:
-            await backfill_links(bucket_mgr, embedding_engine, _RELATION_BACKFILL)
+            await backfill_links(bucket_mgr, embedding_engine, _RELATION_BACKFILL,
+                                 thresholds=resolve_thresholds(config.get("relations")), rebuild=rebuild)
         except Exception as e:
             _RELATION_BACKFILL["last_error"] = f"{type(e).__name__}: {e}"[:300]
             logger.error(f"relation backfill crashed / 关系回填中断: {e}")

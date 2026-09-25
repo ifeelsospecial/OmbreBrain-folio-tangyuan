@@ -1737,6 +1737,22 @@ class BucketManager:
             deleted = await self._purge_locked(bucket_id)
             return {"ok": deleted, "deleted": deleted, "reason": clean_reason}
 
+    async def rewrite_bucket_metadata(self, bucket_id: str, fn) -> bool:
+        """在桶锁下读 frontmatter, fn(post) 返回 True 才写回。不刷新 last_active(用于关系这类派生元数据)。"""
+        async with self._bucket_turn(bucket_id):
+            path = self._find_bucket_file(bucket_id)
+            if not path:
+                return False
+            try:
+                post = frontmatter.load(path)
+            except Exception:
+                return False
+            if not fn(post):
+                return False
+            _atomic_write_text(path, frontmatter.dumps(post))
+            self._invalidate_active_cache()
+            return True
+
     async def mutate_relation_pair(self, left_bucket_id: str, right_bucket_id: str, mutation):
         """在两把有序的桶锁下原子地修改一对互为镜像的 relation_links(移植自上游 3.2.0)。
 

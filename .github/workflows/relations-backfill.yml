@@ -7,6 +7,11 @@ name: 补建存量记忆的桶间关系
 
 on:
   workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "先清掉所有自动建立的关系(手动改过的保留)再重建——调过门槛后勾选"
+        type: boolean
+        default: false
 
 jobs:
   backfill:
@@ -23,7 +28,9 @@ jobs:
             echo "::error::需要 Variable OMBRE_BACKUP_URL 和 Secret OMBRE_ADMIN_TOKEN"; exit 1
           fi
           URL="${BASE_URL%/}/api/relations/backfill"
-          curl -sS --retry 3 --retry-delay 20 --max-time 90 -X POST -H "X-Admin-Token: $ADMIN_TOKEN" "$URL"; echo
+          START_URL="$URL"
+          if [ "${{ inputs.rebuild }}" = "true" ]; then START_URL="$URL?rebuild=1"; fi
+          curl -sS --retry 3 --retry-delay 20 --max-time 90 -X POST -H "X-Admin-Token: $ADMIN_TOKEN" "$START_URL"; echo
           for i in $(seq 120); do
             sleep 30
             body=$(curl -sS --retry 3 --retry-delay 10 --max-time 60 -H "X-Admin-Token: $ADMIN_TOKEN" "$URL" || echo '{}')
