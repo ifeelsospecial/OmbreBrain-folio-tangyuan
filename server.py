@@ -671,7 +671,8 @@ async def capture_hook(request):
     event_time = body.get("event_time") or ""
 
     try:
-        result = await grow(content, event_time=event_time)
+        # 把这一段对话原文一起交给 grow: 拆出来的每条记忆都挂上 raw_source, source 工具才有原话可查
+        result = await _grow_impl(content, event_time=event_time, raw_source=content)
         _invalidate_buckets_cache()
         return JSONResponse({"ok": True, "result": result})
     except Exception as e:
@@ -739,6 +740,7 @@ async def _merge_or_create(
     test_data: bool = False,
     quotes: list | None = None,
     notes: list | None = None,
+    raw_source: str = "",
 ) -> tuple[str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
@@ -806,6 +808,8 @@ async def _merge_or_create(
                         notes.append(f"合并进的记忆已有 {len(have)} 条引语，上限 {MAX_QUOTES}，"
                                      f"本次有 {overflow} 条没存；想换掉旧的用 trace(quotes_replace=...)")
                     update_kwargs["quotes_append"] = quotes
+                if raw_source and raw_source.strip():
+                    update_kwargs["raw_source"] = _append_raw_source(bucket["metadata"].get("raw_source"), raw_source)
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
@@ -830,9 +834,30 @@ async def _merge_or_create(
     )
     if quotes:
         await bucket_mgr.update(bucket_id, quotes=quotes)
+    if raw_source and raw_source.strip():
+        await bucket_mgr.update(bucket_id, raw_source=_append_raw_source("", raw_source))
     if not test_data:
         _schedule_relation_link(bucket_id, content)
     return bucket_id, False
+
+
+_RAW_SOURCE_CAP = 8000  # 与 BucketManager.update 的 raw_source 截断上限一致
+
+
+def _append_raw_source(existing, new: str) -> str:
+    """合并进已有记忆时原文追加不覆盖; 超出上限保留最近的部分(最新的对话最可能被核对), 并标明前面有省略。"""
+    new = str(new or "").strip()
+    old = str(existing or "").strip()
+    if not old:
+        combined = new
+    elif new in old:
+        combined = old
+    else:
+        combined = f"{old}\n\n———\n\n{new}"
+    if len(combined) > _RAW_SOURCE_CAP:
+        marker = "（更早的原文已省略）\n"
+        combined = marker + combined[-(_RAW_SOURCE_CAP - len(marker)):]
+    return combined
 
 
 def _schedule_relation_link(bucket_id: str, content: str) -> None:
@@ -1810,6 +1835,11 @@ async def hold(
 @mcp.tool()
 async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
     """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance,quotes}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。quotes 同 hold(每条最多3句、每句100字,任一条超限整次拒绝);只有 items 方式能带引语,content 方式是系统替你拆的,不带。"""
+    return await _grow_impl(content=content, event_time=event_time, items=items)
+
+
+async def _grow_impl(content: str = "", event_time: str = "", items: list | None = None, raw_source: str = "") -> str:
+    """grow 的实现。raw_source: capture-hook 传入的这一段对话原文, 挂到这次拆出/合并到的每条记忆上, 供 source 工具读取。"""
     await decay_engine.ensure_started()
     grow_batch_id = f"grow_{uuid.uuid4().hex[:16]}"
 
@@ -1861,6 +1891,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
             try:
                 analysis = await _analyze_with_fallback(item_content)
                 result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
                     content=item_content,
                     tags=analysis.get("tags") or [],
                     importance=item_importance if item_importance is not None else 5,
@@ -1903,6 +1934,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         logger.info(f"grow short-content fast path: {len(content.strip())} chars")
         analysis = await _analyze_with_fallback(content)
         result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
             content=content.strip(),
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1932,6 +1964,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
         logger.warning("grow digest 为空, 整段存为单条记忆 (兜底防丢)")
         analysis = await _analyze_with_fallback(content)
         result_name, _is_merged = await _merge_or_create(
+                    raw_source=raw_source,
             content=content.strip(),
             tags=analysis.get("tags") or [],
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -1961,6 +1994,7 @@ async def grow(content: str = "", event_time: str = "", items: list | None = Non
                 results.append(f"⚠️{item.get('name', '?')}（{item_size_error}）")
                 continue
             result_name, is_merged = await _merge_or_create(
+                    raw_source=raw_source,
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
