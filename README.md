@@ -239,7 +239,7 @@ Claude ←→ MCP Protocol ←→ server.py
 ### 检索架构 / Search Architecture
 
 ```
-breath(query="今天很累")
+breath_search(query="今天很累")
          │
     ┌────┴────┐
     │         │
@@ -492,13 +492,13 @@ Feel is not an event log — it's **what the model carries away**: a feeling, an
 - `valence` 是模型的感受，不是事件情绪。同一段争吵，事件 V0.2，但模型可能 V0.4（「我从中看到了成长」）
 - `source_bucket` 指向被消化的记忆，会被标记为「已消化」→ 加速淡化到无限小，但不会被删除
 - Feel 不参与普通浮现、不衰减、不参与 dreaming
-- 用 `breath(domain="feel")` 读取之前的 feel
+- 用 `breath_advanced(domain="feel")` 读取之前的 feel
 
 ### 对话启动完整流程 / Conversation Start Sequence
 ```
 1. breath()              — 睁眼，看有什么浮上来
 2. dream()               — 消化最近记忆，有沉淀写 feel
-3. breath(domain="feel") — 读之前的 feel
+3. breath_advanced(domain="feel") — 读之前的 feel
 4. 开始和用户说话
 ```
 
