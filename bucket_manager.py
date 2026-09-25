@@ -1293,6 +1293,25 @@ class BucketManager:
                 post["level"] = 1 if int(kwargs["level"]) == 1 else 2
             except (TypeError, ValueError):
                 post["level"] = 2
+        if "quotes" in kwargs:
+            # 整体替换(已由调用方归一化 / 校验); 空列表 = 删除全部引语
+            from quote_store import normalize_quotes
+            quotes = normalize_quotes(kwargs["quotes"])
+            if quotes:
+                post["quotes"] = quotes
+            else:
+                _drop("quotes")
+        if "quotes_append" in kwargs:
+            # 合并到已有桶: 追加不覆盖(每条引语属于它自己的时刻), 超上限保留先来的
+            from quote_store import normalize_quotes, quotes_from_metadata, MAX_QUOTES
+            existing = quotes_from_metadata(post.metadata)
+            seen = {(q["text"], q.get("speaker", "")) for q in existing}
+            for q in normalize_quotes(kwargs["quotes_append"]):
+                if (q["text"], q.get("speaker", "")) not in seen and len(existing) < MAX_QUOTES:
+                    existing.append(q)
+                    seen.add((q["text"], q.get("speaker", "")))
+            if existing:
+                post["quotes"] = existing
         if "why_remembered" in kwargs:
             why = str(kwargs["why_remembered"] or "").strip()[:500]
             if why:

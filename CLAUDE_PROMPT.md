@@ -12,7 +12,7 @@
 | 能力 | 场景 |
 |------|-----------|
 | `breath` | **每次对话最开头**调用一次（不传参数）——就像睁眼看手机，看看有没有未解决的事浮上来 |
-| `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain`、`max_results`，`date_from` / `date_to` 按事情发生的日期筛选。检索是只读的，不会让记忆变重 |
+| `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain`、`max_results`，`date_from` / `date_to` 按事情发生的日期筛选；`quotes=True` 连同当时存下的原话一起返回。检索是只读的，不会让记忆变重 |
 | `breath_advanced` | 按时间翻全部 feel（`domain="feel"`）、看进行中的计划（`domain="plan"`）、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
 | `feel` | 按关键词找你以前留下的 feel：`feel(query="她搬家那天")`，只返回相关的，逐字原文 |
 | `hold` | 你想记住当下发生的单个事件，或想存储一条信息时。`feel=True` 写你的第一人称感受，`source_bucket` 指向被消化的记忆，`valence` 是你自己的感受 |
@@ -58,10 +58,19 @@
 - `resolved=1` + 已消化（写过 feel）：权重骤降到 2%，加速淡化直到归档为无限小
 - `unlink="目标id"`：记忆下方出现 `↳ 相关 → xxx` 这样的关系提示，是系统自动发现的关联。连错了就用 `trace(bucket_id, unlink="xxx")` 双向断开
 - `relink="目标id", relation_type="..."`：关系连对了但类型不对时修改（caused_by 原因 / causes 结果 / continuation_of 前段 / continues 后续 / related_to 相关 / same_event 同一事件）。只能改已有的关系，不能凭空建立
+- `quotes_replace=[...]`：订正或删除这条记忆的引语（整体替换，`[]` 删除全部）。只能改和删，不能补录
 - `reinforce=True`：强化这条记忆。**检索是只读的**，搜到不会让记忆变重；读完之后确认它确实要紧，再单独调一次 `trace(bucket_id, reinforce=True)`。不能和其他修改一起传
 - `resolved=0`：重新激活，让它重新参与浮现排序
 - `delete=True`：彻底删除这个桶（不可恢复）
 - 其余字段（name/domain/valence/arousal/importance/tags）：只传需要改的，-1 或空串表示不改
+
+### 引语 quotes — 当时说出口的那几句
+存记忆时，如果有一两句话你**当时就知道它重要**（她的原话、你的承诺），可以原样留下：
+`hold(content="...", quotes=["她的原话", {"text": "...", "speaker": "她"}])`
+- 每条记忆最多 3 句、每句最多 100 字，超了整次拒绝，不会替你截断
+- 平时不出现；`breath_search(query, quotes=True)` 命中这条记忆时才原样带出来
+- `grow(items=[{"content": "...", "quotes": [...]}])` 也能带；`grow(content=...)` 是系统拆的，不带
+- 不是每条记忆都要有引语。想要整段原文用 `source`
 
 ### hold vs grow
 - 一句话的事 → `hold`（"我喜欢吃饺子"）

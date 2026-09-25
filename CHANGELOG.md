@@ -2,6 +2,15 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-09-26 · 引语 quotes（对齐上游 3.1.0 / 3.4.0）
+
+- **写入**：`hold(quotes=[...])`、`grow(items=[{..., "quotes": [...]}])` 可带"当时说出口、当时就知道重要"的几句原话，原样存进 frontmatter。每桶最多 3 条、每条最多 100 字，超限整次拒绝（抛工具错误）不截断；feel 不支持；`grow(content=...)` 的系统拆分路径不支持。格式与校验原样移植自上游 `quote_store.py`，去掉了依赖 You/them 的第三方署名渲染。
+- **合并**：引语追加不覆盖，超上限保留先来的，并在返回里明确说明有几条没存。
+- **读出**：唯一出口是 `breath_search(query, quotes=True)`，命中的桶有引语时原样附在后面。breath 浮现 / dream / catalog / feel 都读不到（摘要按白名单渲染，引语不进 AI 压缩与向量索引）。
+- **订正**：`trace(quotes_replace=[...])` 整体替换，`[]` 删除全部；只能改和删，不能补录（原本没有引语时拒绝、条数不能增加）；与其他修改互斥；返回读回磁盘后的结果。
+- 与本 fork 的 `source`（系统自动存的整段对话原文）并存：source 看全文，引语是写入时挑的几句。
+- 测试：新增 `tests/test_quotes.py`（5 例）；已验证去掉"不能补录"与"平时不显示"时对应用例失败。全量 148 passed, 7 skipped。
+
 ## 2026-09-26 · 桶间关系（对齐上游 3.2.0 / 3.3.0）
 
 - **自动建立关系**：hold / grow / capture-hook 新建记忆后，后台用向量相似度 + 时间差推断关系并双向写入 `relation_links`（规则原样移植自上游 `relation_store.py`：same_event ≥0.85 且 ≤6 小时、continuation_of ≥0.75 且 ≤72 小时、related_to ≥0.72；每桶最多 8 条自动关系；因果与 custom 永不自动建）。不调 LLM；fire-and-forget，失败只记日志，不影响写入。feel / plan / letter / I 不参与。只对之后新建的记忆生效，存量记忆不补建。
