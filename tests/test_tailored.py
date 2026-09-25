@@ -246,3 +246,89 @@ async def test_review_decide_resolve_and_keep(srv):
     assert server._review_candidates(await bm.list_all()) == []
     bad = await server.api_review_decide(_R({"id": a, "action": "delete"}))
     assert bad.status_code == 400
+
+
+# ---- 足迹地图 ----
+import places as places_mod
+
+
+class _PlaceLLM:
+    """假 AI: 按正文里的关键词返回地点 JSON; 记录被调用次数。"""
+    api_available = True
+    model = "fake"
+
+    def __init__(self):
+        self.calls = 0
+        outer = self
+
+        class _Completions:
+            async def create(self_inner, **kw):
+                outer.calls += 1
+                text = kw["messages"][1]["content"]
+                out = []
+                if "泰特" in text:
+                    out.append({"name": "泰特现代美术馆", "city": "伦敦", "country": "英国", "lat": 51.5076, "lon": -0.0994})
+                if "南岸" in text:
+                    out.append({"name": "南岸", "city": "伦敦", "country": "英国", "lat": 51.5055, "lon": -0.1160})
+                if "爱丁堡" in text:
+                    out.append({"name": "爱丁堡", "city": "爱丁堡", "country": "英国", "lat": 55.9533, "lon": -3.1883})
+                msg = type("M", (), {"content": "好的，结果如下：" + json.dumps({"places": out}, ensure_ascii=False)})
+                return type("R", (), {"choices": [type("C", (), {"message": msg})]})
+
+        self.client = type("Cl", (), {"chat": type("Ch", (), {"completions": _Completions()})})
+
+    async def dehydrate(self, content, meta=None):
+        return content
+
+    async def analyze(self, content):
+        return {"domain": ["出行"], "valence": 0.6, "arousal": 0.4, "tags": [], "suggested_name": content[:8]}
+
+
+def test_place_filters_and_normalization():
+    assert places_mod.should_extract({"type": "dynamic", "domain": ["出行"]}, "随便")
+    assert places_mod.should_extract({"type": "dynamic", "domain": ["内心"]}, "今天去了海边")
+    assert not places_mod.should_extract({"type": "dynamic", "domain": ["内心"]}, "有点累")
+    assert not places_mod.should_extract({"type": "feel", "domain": ["出行"]}, "去了伦敦")
+    norm = places_mod.normalize_places([
+        {"name": "A", "city": "伦敦", "lat": 51.5, "lon": -0.1},
+        {"name": "A", "city": "伦敦", "lat": 51.5, "lon": -0.1},     # 重复
+        {"name": "零点", "lat": 0, "lon": 0},                          # 明显无效
+        {"name": "越界", "lat": 123, "lon": 0},
+        {"name": "坏", "lat": "x", "lon": 1},
+    ])
+    assert [p["name"] for p in norm] == ["A"]
+
+
+@pytest.mark.asyncio
+async def test_hold_auto_extracts_places_and_map_aggregates(srv, monkeypatch):
+    server, bm = srv
+    llm = _PlaceLLM()
+    monkeypatch.setattr(server, "dehydrator", llm)
+    await server.hold(content="她下午去了泰特现代美术馆，晚上在南岸散步")
+    await server.hold(content="一年前她在爱丁堡看城堡")
+    await server.hold(content="今天有点累，不想说话")                 # 没有去向字眼、领域也不是出行? analyze 返回出行 → 仍会认
+    import asyncio
+    await asyncio.gather(*list(server._BG_TASKS))
+    resp = await server.api_places(type("R", (), {"query_params": {}})())
+    data = json.loads(resp.body)
+    cities = {g["city"]: g for g in data["places"]}
+    assert set(cities) == {"伦敦", "爱丁堡"}
+    assert cities["伦敦"]["count"] == 1                                # 同一条记忆在同城只算一次
+    assert cities["伦敦"]["spots"] == ["南岸", "泰特现代美术馆"]
+    assert data["memories_with_places"] == 2
+
+
+@pytest.mark.asyncio
+async def test_places_backfill_skips_already_checked(srv, monkeypatch):
+    server, bm = srv
+    llm = _PlaceLLM()
+    a = await bm.create(content="她去了爱丁堡", domain=["出行"])
+    b = await bm.create(content="她在家看书", domain=["居家"])        # 不会被看
+    progress = {}
+    await places_mod.backfill_places(bm, llm, progress, pause_s=0)
+    assert progress["total"] == 1 and progress["with_places"] == 1 and llm.calls == 1
+    assert (await bm.get(a))["metadata"]["places"][0]["city"] == "爱丁堡"
+    assert "places" not in (await bm.get(b))["metadata"]
+    progress2 = {}
+    await places_mod.backfill_places(bm, llm, progress2, pause_s=0)
+    assert progress2["total"] == 0 and llm.calls == 1                 # 看过的不再看

@@ -859,6 +859,7 @@ async def _merge_or_create(
         await bucket_mgr.update(bucket_id, raw_source=_append_raw_source("", raw_source))
     if not test_data:
         _schedule_relation_link(bucket_id, content)
+        _schedule_place_extraction(bucket_id, content, domain)
     return bucket_id, False
 
 
@@ -879,6 +880,22 @@ def _append_raw_source(existing, new: str) -> str:
         marker = "（更早的原文已省略）\n"
         combined = marker + combined[-(_RAW_SOURCE_CAP - len(marker)):]
     return combined
+
+
+def _schedule_place_extraction(bucket_id: str, content: str, domain, bucket_type: str = "dynamic") -> None:
+    """新建桶后后台认地点(足迹地图)。只对出行领域/带去向字眼的记忆调 AI; 失败只记日志。"""
+    try:
+        from places import should_extract, attach_places
+        if not coerce_bool(((config.get("places") or {}) if isinstance(config, dict) else {}).get("auto_extract", True),
+                           default=True):
+            return
+        if not should_extract({"type": bucket_type, "domain": list(domain or [])}, content):
+            return
+        task = asyncio.create_task(attach_places(bucket_mgr, dehydrator, bucket_id, content))
+        _BG_TASKS.add(task)
+        task.add_done_callback(_BG_TASKS.discard)
+    except Exception as e:
+        logger.warning(f"schedule place extraction failed / 地点识别未能排队: {e}")
 
 
 def _schedule_relation_link(bucket_id: str, content: str) -> None:
@@ -1992,6 +2009,7 @@ async def hold(
         if quote_list:
             await bucket_mgr.update(bucket_id, quotes=quote_list)
         _schedule_relation_link(bucket_id, content)
+        _schedule_place_extraction(bucket_id, content, domain, bucket_type="permanent")
         return f"📌钉选→{bucket_id} {','.join(str(d) for d in domain if d is not None)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
@@ -3644,6 +3662,47 @@ async def api_review_decide(request):
     ok = await bucket_mgr.rewrite_bucket_metadata(bid, _fn)
     _invalidate_buckets_cache()
     return JSONResponse({"ok": bool(ok), "id": bid, "action": action})
+
+
+# --- 足迹地图(本 fork 新增) ---
+_PLACES_BACKFILL: dict = {"running": False, "processed": 0, "total": 0, "found": 0, "with_places": 0,
+                          "errors": 0, "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/places", methods=["GET"])
+async def api_places(request):
+    """地图数据: 按城市聚合的地点与对应记忆。含归档区(足迹不该因为记忆沉底就从地图上消失)。"""
+    from starlette.responses import JSONResponse
+    from places import aggregate
+    buckets = await bucket_mgr.list_all(include_archive=True)
+    groups = aggregate(buckets)
+    return JSONResponse({"places": groups, "memories_with_places": len({m["id"] for g in groups for m in g["memories"]})})
+
+
+@mcp.custom_route("/api/places/backfill", methods=["GET", "POST"])
+async def api_places_backfill(request):
+    """GET 查进度; POST 后台给还没看过地点的存量记忆认一遍地点(只看出行领域/带去向字眼的)。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _PLACES_BACKFILL.get("running"):
+        return JSONResponse(dict(_PLACES_BACKFILL))
+    from places import backfill_places
+    _PLACES_BACKFILL.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
+
+    async def _run():
+        try:
+            await backfill_places(bucket_mgr, dehydrator, _PLACES_BACKFILL)
+        except Exception as e:
+            _PLACES_BACKFILL["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.error(f"places backfill crashed / 地点回填中断: {e}")
+        finally:
+            _PLACES_BACKFILL["running"] = False
+            _PLACES_BACKFILL["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_PLACES_BACKFILL, "started": True}, status_code=202)
 
 
 @mcp.custom_route("/api/families", methods=["GET"])
