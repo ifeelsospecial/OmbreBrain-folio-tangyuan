@@ -852,6 +852,25 @@ def _schedule_relation_link(bucket_id: str, content: str) -> None:
 # 读不出时间的桶在给了范围时【排除】而非放行: 调用方明说"只要这段时间的", 静默多给等于破坏约定。
 # 核心准则/永久参考不受时间过滤: 它们是准则, 不是那段时间里发生的事(有意的不对称)。
 # ---------------------------------------------------------------
+def _relations_for_api(meta: dict) -> list:
+    """把 relation_links 精简成前端用的 [{target, type, label}]; 数据写坏就返回空, 不让列表接口失败。"""
+    try:
+        from relation_store import normalize_relation_links, relation_display_label
+        links = normalize_relation_links((meta or {}).get("relation_links"))
+    except Exception:
+        return []
+    out = []
+    for link in links:
+        if link.get("status") != "active":
+            continue
+        try:
+            label = relation_display_label(link["type"], link.get("label", ""))
+        except Exception:
+            label = link.get("type", "")
+        out.append({"target": link["target_bucket_id"], "type": link["type"], "label": label})
+    return out
+
+
 def _relation_hint_for(bucket: dict, visible_ids: set | None, limit: int = 2) -> str:
     """桶间关系提示(对齐上游 3.2.0 relation_hint)。只显示目标在当前视野内(活跃、未删除、分级可见)的关系,
     指向回收站/归档/私密桶的边不冒出来。返回形如 "↳ 相关 → <id>" 的行, 没有则空串。"""
@@ -3257,6 +3276,40 @@ def _ensure_family_auto_rebuild():
         pass  # 没有运行中的 loop(理论上不会到这), 下次再试
 
 
+# --- 桶间关系存量回填(本 fork 新增; 上游只在新建时推断) ---
+_RELATION_BACKFILL: dict = {"running": False, "processed": 0, "total": 0, "built": 0,
+                            "errors": 0, "skipped": 0, "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/relations/backfill", methods=["GET", "POST"])
+async def api_relations_backfill(request):
+    """GET 查进度; POST 在后台启动一次存量关系回填(已在跑时直接返回进度)。仅管理员通道可达(/api/*)。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _RELATION_BACKFILL.get("running"):
+        return JSONResponse(dict(_RELATION_BACKFILL))
+
+    from relation_link import backfill_links
+    _RELATION_BACKFILL.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z",
+                               "finished_at": ""})
+
+    async def _run():
+        try:
+            await backfill_links(bucket_mgr, embedding_engine, _RELATION_BACKFILL)
+        except Exception as e:
+            _RELATION_BACKFILL["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.error(f"relation backfill crashed / 关系回填中断: {e}")
+        finally:
+            _RELATION_BACKFILL["running"] = False
+            _RELATION_BACKFILL["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+            _invalidate_buckets_cache()
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_RELATION_BACKFILL, "started": True}, status_code=202)
+
+
 @mcp.custom_route("/api/families", methods=["GET"])
 async def api_families(request):
     """家族列表(含她的编辑态)。?include_dissolved=true 连解散的也回。"""
@@ -3648,6 +3701,8 @@ async def api_buckets(request):
                 "summary": meta.get("summary", ""),  # 用户编辑过的摘要(v2 modal),空则前端回退用 content_preview
                 "why_remembered": meta.get("why_remembered", ""),
                 "meaning": meta.get("meaning", []) or [],
+                # 桶间关系(对齐上游 3.2.0): 记忆星图把它画成独立的关系连线
+                "relations": _relations_for_api(meta),
                 "source_tool": meta.get("source_tool", ""),
                 "grow_batch_id": meta.get("grow_batch_id", ""),
                 "anchor": bool(meta.get("anchor", False)),

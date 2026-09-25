@@ -137,3 +137,59 @@ async def test_core_principle_survives_internalized_mark(srv):
     await bm.update(core, internalized=True)
     out = await server.breath()
     assert "她难过时先抱抱再讲道理" in out
+
+
+# ---- 存量回填 + 星图数据 ----
+
+def _set_created(bm, bid, iso):
+    import frontmatter
+    path = bm._find_bucket_file(bid)
+    post = frontmatter.load(path)
+    post["created"] = iso
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
+    bm._invalidate_active_cache()
+
+
+@pytest.mark.asyncio
+async def test_backfill_links_newer_to_older_once_and_is_idempotent(srv):
+    server, bm, vec = srv
+    old = await bm.create(content="第一次见面")
+    new = await bm.create(content="第二次见面")
+    far = await bm.create(content="不相关")
+    _set_created(bm, old, "2026-07-01T10:00:00Z")
+    _set_created(bm, new, "2026-07-02T10:00:00Z")   # 24 小时后
+    _set_created(bm, far, "2026-06-01T10:00:00Z")
+    vec.scores = {old: 0.80, new: 0.80, far: 0.10}
+    progress = {}
+    await relation_link.backfill_links(bm, vec, progress, pause_s=0)
+    assert progress["total"] == 3 and progress["errors"] == 0 and progress["built"] == 1
+    fwd, back = await _links(bm, new), await _links(bm, old)
+    assert fwd[old]["type"] == "continuation_of" and back[new]["type"] == "continues"   # 方向: 新的接续旧的
+    assert await _links(bm, far) == {}
+    progress2 = {}
+    await relation_link.backfill_links(bm, vec, progress2, pause_s=0)
+    assert progress2["built"] == 0                                                       # 重跑不重复
+    assert len(await _links(bm, new)) == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_endpoint_and_relations_in_bucket_api(srv, monkeypatch):
+    server, bm, vec = srv
+    a = await bm.create(content="A 事")
+    b = await bm.create(content="B 事")
+    vec.scores = {a: 0.80, b: 0.80}
+
+    class _Req:
+        def __init__(self, method):
+            self.method = method
+    monkeypatch.setattr(server, "_RELATION_BACKFILL", {"running": False})
+    resp = await server.api_relations_backfill(_Req("POST"))
+    assert resp.status_code == 202
+    await asyncio.gather(*list(server._BG_TASKS))
+    import json
+    status = json.loads((await server.api_relations_backfill(_Req("GET"))).body)
+    assert status["running"] is False and status["built"] == 1 and status["finished_at"]
+    rels = server._relations_for_api((await bm.get(a))["metadata"]) + server._relations_for_api((await bm.get(b))["metadata"])
+    assert {r["target"] for r in rels} == {a, b} and all(r["label"] for r in rels)
+    assert server._relations_for_api({"relation_links": "broken"}) == []

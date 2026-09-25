@@ -48,13 +48,38 @@ function buildLinks(items) {
       links.push({ source: a.id, target: b.id, weight: w, shared: sharedArr });
     }
   }
+
+  // 桶间关系(上游 3.2.0 自动建立): 独立于共享标签的连线, 权重固定偏高, 且不参与下面的 top-N 截断
+  const byId = new Map(items.map(it => [it.id, it]));
+  const pairKey = (x, y) => (x < y ? x + '|' + y : y + '|' + x);
+  const tagIndex = new Map(links.map((l, i) => [pairKey(l.source, l.target), i]));
+  const relLinks = [];
+  const relSeen = new Set();
+  for (const it of items) {
+    for (const r of (it.relations || [])) {
+      if (!r || !byId.has(r.target) || r.target === it.id) continue;
+      const k = pairKey(it.id, r.target);
+      if (relSeen.has(k)) continue;
+      relSeen.add(k);
+      const label = r.label || r.type || '相关';
+      if (tagIndex.has(k)) {
+        const l = links[tagIndex.get(k)];
+        l.relation = label;
+        l.weight = Math.max(l.weight, 3);
+      } else {
+        relLinks.push({ source: it.id, target: r.target, weight: 3, shared: [], relation: label });
+      }
+    }
+  }
   // 保险: 边数过多时只留 top-N
   const MAX_LINKS = 600;
+  let kept = links;
   if (links.length > MAX_LINKS) {
-    links.sort((a, b) => b.weight - a.weight);
-    return links.slice(0, MAX_LINKS);
+    const rel = links.filter(l => l.relation);
+    const rest = links.filter(l => !l.relation).sort((a, b) => b.weight - a.weight);
+    kept = rel.concat(rest.slice(0, Math.max(0, MAX_LINKS - rel.length)));
   }
-  return links;
+  return kept.concat(relLinks);
 }
 
 // ── Quadtree (Barnes-Hut) ──

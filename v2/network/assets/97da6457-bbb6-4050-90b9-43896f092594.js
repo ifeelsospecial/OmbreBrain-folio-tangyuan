@@ -197,8 +197,8 @@ function RightDrawer({ item, items, links, onClose, onSelect, onUpdate, onFocus,
     if (!item) return [];
     const out = [];
     links.forEach(l => {
-      if (l.source === item.id) out.push({ id: l.target, w: l.weight, shared: l.shared });
-      if (l.target === item.id) out.push({ id: l.source, w: l.weight, shared: l.shared });
+      if (l.source === item.id) out.push({ id: l.target, w: l.weight, shared: l.shared, rel: l.relation });
+      if (l.target === item.id) out.push({ id: l.source, w: l.weight, shared: l.shared, rel: l.relation });
     });
     return out.sort((a, b) => b.w - a.w).slice(0, 5)
       .map(r => ({ ...r, item: items.find(i => i.id === r.id) }))
@@ -305,7 +305,9 @@ function RightDrawer({ item, items, links, onClose, onSelect, onUpdate, onFocus,
                     <span className="cs-right-related-dot" style={{ background: TYPE_VIS[inferType(r.item)].fill }}/>
                     <span>{inferType(r.item)}</span>
                     <span style={{ opacity: 0.5 }}>·</span>
-                    <span>共享 {(r.shared || []).join(' / ') || '同日'}</span>
+                    {r.rel
+                      ? <span className="cs-right-related-rel">关系 · {(((item.relations || []).find(x => x.target === r.id) || {}).label) || r.rel}</span>
+                      : <span>共享 {(r.shared || []).join(' / ') || '同日'}</span>}
                     <span style={{ marginLeft: 'auto', fontFamily: 'var(--mono)' }}>w {r.w.toFixed(1)}</span>
                   </div>
                   <div className="cs-right-related-title">{r.item.title}</div>

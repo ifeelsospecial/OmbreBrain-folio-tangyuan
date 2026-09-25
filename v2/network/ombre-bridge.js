@@ -39,6 +39,7 @@
       summary: b.summary || '',           // 用户没填就空,跟其他视图一致
       why_remembered: b.why_remembered || '',
       meaning: Array.isArray(b.meaning) ? b.meaning : [],
+      relations: Array.isArray(b.relations) ? b.relations : [],   // 桶间关系(上游 3.2.0), 星图画成关系连线
       body: '',  // 列表 endpoint 不返回 content;打开详情时再 lazy-load
       importance: b.importance || 5,
       score: typeof b.score === 'number' ? b.score : 0,   // decay 分数
