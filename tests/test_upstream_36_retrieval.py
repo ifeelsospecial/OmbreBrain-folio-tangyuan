@@ -123,3 +123,71 @@ async def test_surfacing_reserves_slots_for_recent_buckets(srv, monkeypatch):
     monkeypatch.setitem(server.config, "surfacing", {"recent_slots": 0})
     out = await server.breath(max_results=4)
     assert not any(bid in out for bid in recent)
+
+
+# ---- 对齐上游 3.0.0: feel 定向检索 / plan 通道 ----
+
+class _FeelVectors:
+    enabled = True
+
+    def __init__(self, scores):
+        self.scores = scores
+
+    async def search_similar_strict(self, query, top_k=10):
+        return sorted(self.scores.items(), key=lambda kv: -kv[1])[:top_k]
+
+
+@pytest.mark.asyncio
+async def test_feel_tool_vector_threshold_and_verbatim(srv, monkeypatch):
+    server, bm = srv
+    near = await bm.create(content="她搬家那天我其实很舍不得", bucket_type="feel")
+    far = await bm.create(content="关于咖啡的一点感受", bucket_type="feel")
+    ordinary = await bm.create(content="她搬家那天下雨", name="搬家")
+    monkeypatch.setattr(server, "embedding_engine", _FeelVectors({near: 0.82, far: 0.40, ordinary: 0.99}))
+    out = await server.feel(query="搬家")
+    assert "她搬家那天我其实很舍不得" in out      # 逐字
+    assert "咖啡" not in out                      # 低于 0.65 不凑数
+    assert ordinary not in out                    # 只在 feel 里找
+    assert "需要一个关键词" in await server.feel()
+
+
+@pytest.mark.asyncio
+async def test_feel_tool_falls_back_to_keywords_with_notice(srv):
+    server, bm = srv
+    await bm.create(content="下雨天会想起她", bucket_type="feel")
+    out = await server.feel(query="下雨")          # srv 默认向量不可用
+    assert out.startswith("（语义检索暂不可用")
+    assert "下雨天会想起她" in out
+    assert "没有和" in await server.feel(query="不存在的词")
+
+
+@pytest.mark.asyncio
+async def test_feel_tool_respects_private_level(srv, monkeypatch):
+    from bucket_manager import ACCESS_LEVEL
+    server, bm = srv
+    tok = ACCESS_LEVEL.set(2)
+    try:
+        secret = await bm.create(content="私密的 feel 下雨", bucket_type="feel", level=2)
+    finally:
+        ACCESS_LEVEL.reset(tok)
+    monkeypatch.setattr(server, "embedding_engine", _FeelVectors({secret: 0.95}))
+    tok = ACCESS_LEVEL.set(1)
+    try:
+        out = await server.feel(query="下雨")
+    finally:
+        ACCESS_LEVEL.reset(tok)
+    assert "私密的 feel" not in out
+
+
+@pytest.mark.asyncio
+async def test_breath_advanced_plan_channel(srv):
+    server, bm = srv
+    active = await server.plan(content="答应她周末一起看电影", weight=0.7)
+    await bm.create(content="核心准则", name="核心", highlight=True)
+    out = await server.breath_advanced(domain="plan")
+    assert "=== 进行中的计划 ===" in out
+    assert "答应她周末一起看电影" in out
+    assert "核心准则" not in out
+    pid = [b["id"] for b in await bm.list_all() if (b["metadata"].get("type") == "plan")][0]
+    await server.trace(bucket_id=pid, status="resolved")
+    assert "没有进行中的计划" in await server.breath_advanced(domain="plan")

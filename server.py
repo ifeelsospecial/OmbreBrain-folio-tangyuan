@@ -1030,6 +1030,34 @@ async def _breath_impl(
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
 
+    # --- Plan 通道(对齐上游 3.0.0 修复): domain="plan" 直接列进行中的 plan ---
+    # 此前 plan 桶被普通浮现排除, domain 又只在 catalog/检索里生效, 不带 query 调用会落进浮现模式,
+    # 返回核心准则 + 高权重桶而不是 plan。逐字返回, 不调 LLM, 已 resolved/abandoned 的不返回。
+    if domain.strip().lower() == "plan":
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.error(f"Plan retrieval failed: {e}")
+            return "读取 plan 失败。"
+        plans = [
+            b for b in all_buckets
+            if (b.get("metadata") or {}).get("type") == "plan"
+            and str((b.get("metadata") or {}).get("status") or "active").lower() == "active"
+            and _bucket_in_date_range(b.get("metadata") or {}, date_lo, date_hi)
+        ]
+        plans.sort(key=lambda b: (b.get("metadata") or {}).get("created", ""), reverse=True)
+        if not plans:
+            return "没有进行中的计划。"
+        results = []
+        for b in plans:
+            meta = b.get("metadata") or {}
+            entry = (f"[{str(meta.get('created', ''))[:10]}] [bucket_id:{b['id']}] "
+                     f"[weight:{meta.get('weight', '?')}]\n{strip_wikilinks(b.get('content', ''))}")
+            if results and count_tokens_approx("\n---\n".join(results + [entry])) > max_tokens:
+                break
+            results.append(entry)
+        return "=== 进行中的计划 ===\n" + "\n---\n".join(results)
+
     # --- No args or empty query: surfacing mode (weight pool active push) ---
     # --- 无参数或空query：浮现模式（权重池主动推送）---
     if not query or not query.strip():
@@ -1454,6 +1482,80 @@ async def breath_advanced(
         date_from=date_from,
         date_to=date_to,
     )
+
+
+@mcp.tool()
+async def feel(query: str = "", max_tokens: int = 10000, date_from: str = "", date_to: str = "") -> str:
+    """按关键词找你以前留下的 feel——回答"我此刻在想的这件事，我以前怎么感受的"。query 必填；只返回相关的 feel，逐字原文，不摘要。想按时间顺序翻全部 feel 用 breath_advanced(domain="feel")。date_from/date_to 按日期筛选。"""
+    return await _feel_search(query=query, max_tokens=max_tokens, date_from=date_from, date_to=date_to)
+
+
+_FEEL_VECTOR_THRESHOLD = 0.65  # 对齐上游 3.0.0: 与 breath_search 向量通道同一门槛
+
+
+async def _feel_search(query: str = "", max_tokens: int = 10000, date_from: str = "", date_to: str = "") -> str:
+    """feel 定向检索(对齐上游 3.0.0 feel 工具)。候选限定在当前视野可见的 feel 桶内(经 list_all 分级过滤);
+    向量相似度 ≥ 0.65 才算命中, 先按相似度再按时间倒序; 向量不可用时退回字面匹配并在首行说明。
+    未命中不凑数; 放不下的整条省略而不是截断。"""
+    text = str(query or "").strip()
+    if not text:
+        return ('feel 需要一个关键词，比如 feel(query="她搬家那天")。'
+                '想按时间顺序翻全部 feel，用 breath_advanced(domain="feel")。')
+    size_error = _payload_size_error("查询", text, "max_query_bytes", 16 * 1024)
+    if size_error:
+        return size_error
+    try:
+        lo, hi = _parse_date_range(date_from, date_to)
+    except _DateRangeError as e:
+        return str(e)
+    try:
+        max_tokens = max(1, min(int(max_tokens), 20000))
+    except (TypeError, ValueError):
+        max_tokens = 10000
+
+    feels = {
+        b["id"]: b for b in await bucket_mgr.list_all(include_archive=False)
+        if (b.get("metadata") or {}).get("type") == "feel"
+        and _bucket_in_date_range(b.get("metadata") or {}, lo, hi)
+    }
+    if not feels:
+        return "这段时间没有留下 feel。" if (lo or hi) else "没有留下过 feel。"
+
+    notice = ""
+    scored: list[tuple[float, dict]] = []
+    vectors_ok = bool(embedding_engine and getattr(embedding_engine, "enabled", False))
+    if vectors_ok:
+        try:
+            # top_k 取全库: 向量排序是跨所有桶的, 只取前几十条时 feel 会被普通桶挤掉
+            hits = await embedding_engine.search_similar_strict(text, top_k=100000)
+            scored = [(sim, feels[bid]) for bid, sim in hits if bid in feels and sim >= _FEEL_VECTOR_THRESHOLD]
+        except Exception as e:
+            logger.warning(f"feel vector search failed, falling back to keywords: {e}")
+            vectors_ok = False
+    if not vectors_ok:
+        notice = "（语义检索暂不可用，以下是字面匹配结果）\n"
+        needle = text.lower()
+        scored = [(0.0, b) for b in feels.values() if needle in str(b.get("content", "")).lower()]
+
+    if not scored:
+        return notice + f"没有和「{text}」相关的 feel。"
+    scored.sort(key=lambda pair: (pair[0], (pair[1].get("metadata") or {}).get("created", "")), reverse=True)
+
+    parts, used, omitted = [], 0, 0
+    for sim, b in scored:
+        meta = b.get("metadata") or {}
+        head = f"[{str(meta.get('created', ''))[:10]}] [bucket_id:{b['id']}]" + (f" [相似度:{sim:.2f}]" if sim else "")
+        entry = f"{head}\n{strip_wikilinks(b.get('content', ''))}"
+        cost = count_tokens_approx(entry)
+        if used + cost > max_tokens:
+            omitted += 1
+            continue
+        parts.append(entry)
+        used += cost
+    if not parts:
+        return notice + f"相关的 feel 太长，放不进 max_tokens={max_tokens}，调大一点再试。"
+    tail = f"\n（另有 {omitted} 条相关 feel 因长度省略）" if omitted else ""
+    return notice + "=== 相关的 feel ===\n" + "\n---\n".join(parts) + tail
 
 
 # =============================================================
