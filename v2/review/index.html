@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.js"></script>
+<title>每周回顾</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<style>
+  :root {
+    --bg: #f4f3f7; --paper: #ffffff; --ink: #1a1922; --ink-3: #6d6a7c; --ink-4: #a6a3b3;
+    --accent: #6e4f9a; --rose: #d291b3; --line: rgba(26, 25, 34, 0.08);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #1a1820; --paper: #23212b; --ink: #ebe9ee; --ink-3: #9c98a8; --ink-4: #6d6a7c;
+      --accent: #b39ad8; --rose: #d291b3; --line: rgba(235, 233, 238, 0.08);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
+  }
+  main { max-width: 680px; margin: 0 auto; padding: 28px 16px 64px; }
+  header { margin-bottom: 20px; }
+  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: 0.01em; }
+  .lede { color: var(--ink-3); margin: 0; }
+  .count { color: var(--accent); font-weight: 600; }
+  .card {
+    background: var(--paper); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 16px; margin: 0 0 12px; transition: opacity .25s, transform .25s;
+  }
+  .card.leaving { opacity: 0; transform: translateX(12px); }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; color: var(--ink-3); margin-bottom: 4px; }
+  .name { font-weight: 600; margin: 0 0 4px; }
+  .preview { color: var(--ink); opacity: .85; margin: 0 0 12px; word-break: break-word; }
+  .actions { display: flex; gap: 8px; }
+  button {
+    font: inherit; font-size: 14px; border-radius: 10px; padding: 8px 14px; cursor: pointer;
+    border: 1px solid var(--line); background: transparent; color: var(--ink); min-height: 40px;
+  }
+  button.let-go { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .empty, .error { text-align: center; color: var(--ink-3); padding: 48px 8px; }
+  .error { color: var(--rose); }
+  .more { display: block; margin: 16px auto 0; }
+  footer { margin-top: 28px; font-size: 12.5px; color: var(--ink-4); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>每周回顾</h1>
+    <p class="lede" id="lede">正在找可能已经过去的事…</p>
+  </header>
+  <section id="list" aria-live="polite"></section>
+  <button class="more" id="more" hidden>再看一批</button>
+  <footer>
+    这里列的是两周前发生、最近两周也没再被想起、重要度 6 以下的普通记忆，最不重要的排在前面。导入的旧记忆和你亲手写的不会出现。
+    <b>放下</b>：它会沉底，不再主动浮现，关键词仍能搜到，之后随衰减移进归档区，可以在 dashboard 恢复。
+    <b>留着</b>：两个月内不再问。
+    钉选、保护、坐标、feel、约定和信件都不会出现在这里。
+  </footer>
+</main>
+<script>
+(function () {
+  const list = document.getElementById('list');
+  const lede = document.getElementById('lede');
+  const more = document.getElementById('more');
+  let remaining = 0;
+
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function renderLede() {
+    lede.innerHTML = remaining > 0
+      ? `有 <span class="count">${remaining}</span> 条可能已经过去的事。哪些放下，哪些留着，你来定。`
+      : '这周没有需要回顾的旧事。';
+  }
+
+  async function load() {
+    list.innerHTML = '';
+    more.hidden = true;
+    try {
+      const r = await fetch('/api/review/candidates?limit=20');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const data = await r.json();
+      remaining = data.total || 0;
+      renderLede();
+      if (!data.items.length) {
+        list.innerHTML = '<p class="empty">都清爽了。</p>';
+        return;
+      }
+      for (const it of data.items) list.appendChild(card(it));
+      more.hidden = remaining <= data.items.length;
+    } catch (e) {
+      lede.textContent = '';
+      list.innerHTML = `<p class="error">没能读到记忆（${esc(e.message)}）。刷新一下试试。</p>`;
+    }
+  }
+
+  function card(it) {
+    const el = document.createElement('article');
+    el.className = 'card';
+    el.innerHTML = `
+      <div class="meta"><span>${esc(it.day)}</span><span>${esc(it.age_days)} 天前</span>
+        <span>${esc((it.domain || []).join(' · '))}</span><span>重要度 ${esc(it.importance)}</span></div>
+      <p class="name">${esc(it.name)}</p>
+      <p class="preview">${esc(it.preview)}</p>
+      <div class="actions">
+        <button class="let-go" data-act="resolve">放下</button>
+        <button data-act="keep">留着</button>
+      </div>`;
+    el.querySelectorAll('button').forEach(btn => btn.addEventListener('click', () => decide(el, it.id, btn.dataset.act)));
+    return el;
+  }
+
+  async function decide(el, id, action) {
+    el.querySelectorAll('button').forEach(b => (b.disabled = true));
+    try {
+      const r = await fetch('/api/review/decide', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, action }),
+      });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      el.classList.add('leaving');
+      setTimeout(() => {
+        el.remove();
+        remaining = Math.max(0, remaining - 1);
+        renderLede();
+        if (!list.children.length) load();
+      }, 250);
+    } catch (e) {
+      el.querySelectorAll('button').forEach(b => (b.disabled = false));
+      alert('没保存上：' + e.message);
+    }
+  }
+
+  more.addEventListener('click', load);
+  load();
+})();
+</script>
+</body>
+</html>

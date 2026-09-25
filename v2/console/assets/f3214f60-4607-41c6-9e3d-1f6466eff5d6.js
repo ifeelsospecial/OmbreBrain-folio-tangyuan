@@ -44,6 +44,7 @@ function ConsoleNav({ active, trashCount = 0 }) {
     { id: 'config',    label: '配置',       href: '/v2/console/config/' },
     { id: 'safety',    label: '数据安全',   href: '/v2/console/safety/' },
     { id: 'operations', label: '部署连接',   href: '/v2/console/operations/' },
+    { id: 'review',    label: '每周回顾',   href: '/v2/review/' },
     { id: 'trash',     label: '回收站',     href: '/v2/console/trash/' },
   ];
   return (

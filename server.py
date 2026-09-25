@@ -419,6 +419,13 @@ async def breath_hook(request):
                 except Exception:
                     day_summary = strip_wikilinks(db.get("content", ""))[:300]
                 parts.append(f"🕰 {title}：{day_summary}")
+            # 周日提醒一次: 有攒下的旧事等她确认放不放下(每周回顾页 /v2/review/)
+            from datetime import datetime as _dt
+            if _dt.utcnow().weekday() == 6:
+                n_review = len(_review_candidates(all_buckets, limit=100000))
+                if n_review >= 5:
+                    parts.append(f"🗂 这周攒了 {n_review} 条可能已经过去的旧事。合适的时候可以提醒她去「每周回顾」"
+                                 f"（dashboard 的 /v2/review/）看看，哪些放下、哪些留着。")
         except Exception as e:
             logger.warning(f"breath-hook extra sections failed: {e}")
 
@@ -982,6 +989,64 @@ def _due_phrase(delta: int) -> str:
     if delta > 1:
         return f"{delta} 天后"
     return f"已经过了 {-delta} 天，还没做"
+
+
+# ---------------------------------------------------------------
+# 每周回顾(本 fork 定制): 列出"可能已经过去的事", 由她一键放下或保留。
+# 578 条动态记忆里只有 3 条被放下过——dream 里的"放下"几乎没发生, 浮现池一直是同一批旧事。
+# 不替她自动放下: 这是她的事, 系统只负责把候选摆出来。
+# ---------------------------------------------------------------
+_REVIEW_MIN_AGE_DAYS = 14
+_REVIEW_IDLE_DAYS = 14
+_REVIEW_MAX_IMPORTANCE = 6
+_REVIEW_KEEP_DAYS = 60
+
+
+def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
+    from datetime import datetime as _dt, date as _date
+    from utils import days_since_iso as _days_since
+    today = today or _dt.utcnow().date()
+    rows = []
+    for b in all_buckets:
+        meta = b.get("metadata") or {}
+        # 导入的(别处带来的背景经历)和她在 dashboard 亲手写的, 都不拿来问"要不要放下"
+        if meta.get("created_by") in ("import", "user"):
+            continue
+        if (meta.get("type", "dynamic") != "dynamic" or meta.get("resolved") or is_protected(meta)
+                or is_highlighted(meta) or is_internalized(meta) or meta.get("anchor") or meta.get("dont_surface")):
+            continue
+        try:
+            importance = int(meta.get("importance") or 5)
+        except (TypeError, ValueError):
+            importance = 5
+        if importance > _REVIEW_MAX_IMPORTANCE:
+            continue
+        keep_until = str(meta.get("review_keep_until") or "")[:10]
+        try:
+            if keep_until and _date.fromisoformat(keep_until) >= today:
+                continue
+        except ValueError:
+            pass
+        day = _bucket_day(meta)
+        if day is None or (today - day).days < _REVIEW_MIN_AGE_DAYS:
+            continue
+        if _days_since(meta.get("last_active") or meta.get("created") or "", fallback_days=0) < _REVIEW_IDLE_DAYS:
+            continue
+        age = (today - day).days
+        rows.append({
+            "id": b["id"],
+            "name": meta.get("name") or b["id"],
+            "day": day.isoformat(),
+            "age_days": age,
+            "domain": [str(d) for d in (meta.get("domain") or []) if d],
+            "importance": importance,
+            "preview": strip_wikilinks(str(b.get("content") or ""))[:180],
+            "_rank": (-importance, age),   # 先问最不重要的, 同重要度里先问最久远的
+        })
+    rows.sort(key=lambda r: r["_rank"], reverse=True)
+    for r in rows:
+        r.pop("_rank", None)
+    return rows[:limit]
 
 
 def _relations_for_api(meta: dict) -> list:
@@ -3533,6 +3598,52 @@ async def api_reclassify_uncategorized(request):
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return JSONResponse({**_RECLASSIFY, "started": True}, status_code=202)
+
+
+@mcp.custom_route("/api/review/candidates", methods=["GET"])
+async def api_review_candidates(request):
+    """每周回顾: 可能已经过去的事(见 _review_candidates)。?limit= 默认 30, 最多 100。"""
+    from starlette.responses import JSONResponse
+    try:
+        limit = max(1, min(100, int(request.query_params.get("limit", 30))))
+    except (TypeError, ValueError):
+        limit = 30
+    all_buckets = await bucket_mgr.list_all(include_archive=False)
+    items = _review_candidates(all_buckets, limit=limit)
+    total = len(_review_candidates(all_buckets, limit=100000))
+    return JSONResponse({"items": items, "total": total})
+
+
+@mcp.custom_route("/api/review/decide", methods=["POST"])
+async def api_review_decide(request):
+    """body {id, action: "resolve" | "keep"}。resolve = 放下(resolved=1, 沉底, 之后随衰减归档, 可在归档区恢复);
+    keep = 保留, 60 天内不再问。两者都不刷新激活时间。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt, timedelta as _td
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    bid = str((body or {}).get("id") or "").strip()
+    action = str((body or {}).get("action") or "").strip().lower()
+    if action not in ("resolve", "keep") or not bid:
+        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep)"}, status_code=400)
+    if not await bucket_mgr.get(bid):
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    if action == "resolve":
+        def _fn(post):
+            post["resolved"] = True
+            post["resolved_by"] = "weekly-review"
+            return True
+    else:
+        until = (_dt.utcnow().date() + _td(days=_REVIEW_KEEP_DAYS)).isoformat()
+
+        def _fn(post, _until=until):
+            post["review_keep_until"] = _until
+            return True
+    ok = await bucket_mgr.rewrite_bucket_metadata(bid, _fn)
+    _invalidate_buckets_cache()
+    return JSONResponse({"ok": bool(ok), "id": bid, "action": action})
 
 
 @mcp.custom_route("/api/families", methods=["GET"])

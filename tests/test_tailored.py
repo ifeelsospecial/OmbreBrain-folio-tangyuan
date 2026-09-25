@@ -191,3 +191,58 @@ async def test_reclassify_endpoint_requires_ai(srv, monkeypatch):
     import asyncio
     await asyncio.gather(*list(server._BG_TASKS))
     assert "AI 接口不可用" in server._RECLASSIFY["last_error"] and server._RECLASSIFY["finished_at"]
+
+
+# ---- 每周回顾 ----
+
+def _age(bm, bid, days):
+    import frontmatter
+    path = bm._find_bucket_file(bid)
+    post = frontmatter.load(path)
+    ts = (datetime.utcnow() - timedelta(days=days)).isoformat(timespec="seconds") + "Z"
+    post["created"] = ts
+    post["last_active"] = ts
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
+    bm._invalidate_active_cache()
+
+
+@pytest.mark.asyncio
+async def test_review_candidates_filtering_and_order(srv):
+    server, bm = srv
+    old_small = await bm.create(content="一个月前办的小手续", importance=3)
+    old_mid = await bm.create(content="三周前的普通一天", importance=6)
+    recent = await bm.create(content="上周的事", importance=3)
+    important = await bm.create(content="很重要的旧事", importance=9)
+    pinned = await bm.create(content="钉选的旧事", importance=3, pinned=True)
+    feel = await bm.create(content="旧 feel", bucket_type="feel", importance=3)
+    for bid, days in ((old_small, 30), (old_mid, 21), (recent, 7), (important, 40), (pinned, 40), (feel, 40)):
+        _age(bm, bid, days)
+    ids = [r["id"] for r in server._review_candidates(await bm.list_all())]
+    assert ids == [old_small, old_mid]
+
+
+@pytest.mark.asyncio
+async def test_review_decide_resolve_and_keep(srv):
+    server, bm = srv
+    a = await bm.create(content="该放下的", importance=3)
+    b = await bm.create(content="想留着的", importance=3)
+    _age(bm, a, 30)
+    _age(bm, b, 30)
+    before_active = (await bm.get(a))["metadata"]["last_active"]
+
+    class _R:
+        def __init__(self, body):
+            self._b = body
+            self.query_params = {}
+
+        async def json(self):
+            return self._b
+    assert json.loads((await server.api_review_decide(_R({"id": a, "action": "resolve"}))).body)["ok"]
+    assert json.loads((await server.api_review_decide(_R({"id": b, "action": "keep"}))).body)["ok"]
+    ma, mb = (await bm.get(a))["metadata"], (await bm.get(b))["metadata"]
+    assert ma["resolved"] is True and ma["last_active"] == before_active     # 不刷新激活时间
+    assert mb["review_keep_until"] > datetime.utcnow().date().isoformat()
+    assert server._review_candidates(await bm.list_all()) == []
+    bad = await server.api_review_decide(_R({"id": a, "action": "delete"}))
+    assert bad.status_code == 400
