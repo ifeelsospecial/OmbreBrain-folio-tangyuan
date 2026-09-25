@@ -33,7 +33,7 @@ from datetime import datetime
 
 from openai import AsyncOpenAI
 
-from utils import count_tokens_approx, is_internalized
+from utils import count_tokens_approx, is_internalized, clean_llm_json, positive_float
 
 
 def _short_date(ts) -> str:
@@ -422,12 +422,18 @@ class Dehydrator:
         self.base_url = dehy_cfg.get("base_url", "https://api.deepseek.com/v1")
         self.max_tokens = dehy_cfg.get("max_tokens", 1024)
         self.temperature = dehy_cfg.get("temperature", 0.1)
+        # LLM 请求超时可配(对齐上游 2.4.5): 自托管服务器连云端 API 慢时可调大。
+        # 优先级 env OMBRE_COMPRESS_TIMEOUT_SECONDS > config dehydration.timeout_seconds > 60s
+        self.timeout_seconds = positive_float(
+            os.environ.get("OMBRE_COMPRESS_TIMEOUT_SECONDS") or dehy_cfg.get("timeout_seconds"),
+            60.0,
+        )
         self.api_available = bool(self.api_key)
         if self.api_available:
             self.client = AsyncOpenAI(
                 api_key=self.api_key,
                 base_url=self.base_url,
-                timeout=60.0,
+                timeout=self.timeout_seconds,
             )
         else:
             self.client = None
@@ -725,12 +731,8 @@ class Dehydrator:
         解析并校验 API 返回的打标结果。
         """
         try:
-            # Handle potential markdown code block wrapping
-            # 处理可能的 markdown 代码块包裹
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            result = json.loads(cleaned)
+            # clean_llm_json: 剥 markdown 围栏 + 容忍 JSON 前后说明文字(对齐上游 2.4.6)
+            result = json.loads(clean_llm_json(raw))
         except (json.JSONDecodeError, IndexError, ValueError):
             logger.warning(f"API tagging JSON parse failed / JSON 解析失败: {raw[:200]}")
             return self._default_analysis()
@@ -838,22 +840,13 @@ class Dehydrator:
         解析并校验 API 返回的日记整理结果。
         """
         try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            items = json.loads(cleaned)
+            # clean_llm_json: 围栏+前后说明文字容错(对齐上游 2.4.6)。
+            # 旧的 re.search(r"\[.*\]") 二段兜底已删: 平衡数组 clean_llm_json 必然
+            # 已抠出, 走到 except 的只剩不平衡/截断 JSON, 贪婪正则同样救不回。
+            items = json.loads(clean_llm_json(raw))
         except (json.JSONDecodeError, IndexError, ValueError):
-            # 容错: LLM 偶尔在 JSON 前后裹了说明文字, 抠出第一个 [...] 数组再试一次
-            m = re.search(r"\[.*\]", cleaned, re.DOTALL)
-            if m:
-                try:
-                    items = json.loads(m.group(0))
-                except (json.JSONDecodeError, ValueError):
-                    logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:200]}")
-                    return []
-            else:
-                logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:200]}")
-                return []
+            logger.warning(f"Diary digest JSON parse failed / JSON 解析失败: {raw[:200]}")
+            return []
 
         if not isinstance(items, list):
             return []
@@ -1018,15 +1011,8 @@ class Dehydrator:
     def _parse_redehydrate_v2(self, raw: str) -> tuple[dict, bool]:
         """返回 (parsed_dict, parse_ok)。比旧版 _parse_redehydrate 多一个成功标志。"""
         try:
-            cleaned = raw.strip()
-            # 处理多种 markdown 包装
-            if cleaned.startswith("```json"):
-                cleaned = cleaned[7:].strip()
-            elif cleaned.startswith("```"):
-                cleaned = cleaned[3:].strip()
-            if cleaned.endswith("```"):
-                cleaned = cleaned[:-3].strip()
-            result = json.loads(cleaned)
+            # clean_llm_json: 围栏 + 前后说明文字容错(对齐上游 2.4.6)
+            result = json.loads(clean_llm_json(raw))
         except (json.JSONDecodeError, IndexError, ValueError) as e:
             logger.warning(f"Redehydrate JSON parse failed: {e}; raw snippet: {raw[:200]}")
             return self._default_redehydrate(), False
@@ -1048,10 +1034,7 @@ class Dehydrator:
 
     def _parse_redehydrate(self, raw: str) -> dict:
         try:
-            cleaned = raw.strip()
-            if cleaned.startswith("```"):
-                cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-            result = json.loads(cleaned)
+            result = json.loads(clean_llm_json(raw))
         except (json.JSONDecodeError, IndexError, ValueError):
             logger.warning(f"Redehydrate JSON parse failed: {raw[:200]}")
             return self._default_redehydrate()

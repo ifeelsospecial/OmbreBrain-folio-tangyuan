@@ -165,6 +165,7 @@ function TabBar({ active }) {
   const tabs = [
     { id: 'home',    href: '/',         ic: '◐', label: '记忆' },
     { id: 'review',  href: '/review',   ic: '✓', label: '审阅' },
+    { id: 'fam',     href: '/fam',      ic: '❋', label: '家族' },
     { id: 'cal',     href: '/cal',      ic: '▦', label: '日历' },
     { id: 'setting', href: '/setting',  ic: '⊙', label: '设置' },
   ];
@@ -3685,6 +3686,176 @@ function ImportScreen() {
 // 占位屏(给 /new 等还没实装的路由用)
 // ─────────────────────────────────────────
 
+// ─────────────────────────────────────────
+// 屏 · 家族(记忆家族/归纳层, 2026-07-06 P1)
+// 派生索引层: 向量聚类长出的主题弧线。改名/钉住/解散/一键重建;
+// 原始桶零接触, 重建时她的编辑按成员重叠继承。设计稿=记忆库优化/07。
+// ─────────────────────────────────────────
+
+// 族色: id 哈希 → 冷紫→玫瑰域色相(235-350), 亮暗两套在 CSS 里由 --fam-h 合成
+function famHue(id) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return 235 + (h % 116);
+}
+const famDate = (t) => {
+  const s = String(t || '');
+  return s.length >= 10 ? s.slice(5, 10).replace('-', '·') : '——';
+};
+
+// 时间之弦: 成员按 event_time 在 4%~96% 区间落点; 全同日则均匀铺开
+function FamStrand({ members }) {
+  const ts = members.map(m => new Date(m.event_time || 0).getTime()).filter(t => t > 0);
+  if (ts.length < 2) return null;
+  const min = Math.min(...ts), max = Math.max(...ts);
+  const pos = (t) => max === min ? 50 : 4 + ((t - min) / (max - min)) * 92;
+  return (
+    <React.Fragment>
+      <div className="fam-strand">
+        <div className="rail"/>
+        {members.map((m, i) => {
+          const t = new Date(m.event_time || 0).getTime();
+          const left = t > 0 ? pos(t) : 4 + (i / Math.max(1, members.length - 1)) * 92;
+          return <div key={m.id} className="dot" style={{ left: left + '%' }}/>;
+        })}
+      </div>
+      <div className="fam-span">
+        <span>{famDate(new Date(min).toISOString())}</span>
+        <span>{famDate(new Date(max).toISOString())}</span>
+      </div>
+    </React.Fragment>
+  );
+}
+
+function FamCard({ f, onPatch }) {
+  const [open, setOpen] = useState(false);
+  const [full, setFull] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(f.name);
+
+  const commit = () => {
+    const v = draft.trim();
+    if (v && v !== f.name) onPatch(f.id, { name: v });
+    setEditing(false);
+  };
+
+  return (
+    <div className="fam-card" style={{ '--fam-h': famHue(f.id) }}>
+      <div className="fam-name-row">
+        {editing ? (
+          <input
+            className="fam-name-input"
+            autoFocus
+            value={draft}
+            onChange={e => setDraft(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') commit(); if (e.key === 'Escape') setEditing(false); }}
+            onBlur={commit}
+          />
+        ) : (
+          <div className="fam-name" onClick={() => { setDraft(f.name); setEditing(true); }}>
+            {f.pinned && <span className="pin">✦</span>}{f.name}
+          </div>
+        )}
+        <span className="fam-count">{f.size} 条</span>
+      </div>
+
+      <FamStrand members={f.members || []}/>
+
+      {f.summary && (
+        <p className={'fam-summary' + (full ? ' open' : '')} onClick={() => setFull(v => !v)}>
+          {f.summary}
+        </p>
+      )}
+
+      {open && (
+        <div className="fam-members">
+          {(f.members || []).map(m => (
+            <div key={m.id} className="fam-member" onClick={() => navigate('/mem/' + encodeURIComponent(m.id))}>
+              <span className="d">{famDate(m.event_time)}</span>
+              <span className="n">{m.name}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="fam-foot">
+        <button className="fam-act" onClick={() => setOpen(v => !v)}>{open ? '收起' : '成员'}</button>
+        <span className="fam-dotsep">·</span>
+        <button className="fam-act" onClick={() => onPatch(f.id, { pinned: !f.pinned })}>{f.pinned ? '取消钉住' : '钉住'}</button>
+        <span className="fam-dotsep">·</span>
+        <button
+          className="fam-act warn"
+          onClick={() => {
+            if (window.confirm('解散「' + f.name + '」?\n只是收起这个族, 记忆本体不动; 重建后保持解散。')) onPatch(f.id, { dissolved: true });
+          }}
+        >解散</button>
+      </div>
+    </div>
+  );
+}
+
+function FamiliesScreen() {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = () => api('/api/families')
+    .then(d => { setData(d); setError(null); })
+    .catch(e => setError(e.message));
+  useEffect(() => { load(); }, []);
+
+  const rebuild = async () => {
+    if (busy) return;
+    if (!window.confirm('全量重建家族?\n聚类 + 起名约 1-2 分钟。你的改名/钉住/解散会按成员重叠自动继承。')) return;
+    setBusy(true);
+    try {
+      await api('/api/families/rebuild', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+      });
+      await load();
+    } catch (e) { alert('重建失败: ' + e.message); }
+    finally { setBusy(false); }
+  };
+
+  const patch = async (fid, fields) => {
+    try {
+      await api('/api/family/' + encodeURIComponent(fid), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(fields),
+      });
+      await load();
+    } catch (e) { alert('保存失败: ' + e.message); }
+  };
+
+  const fams = ((data && data.families) || [])
+    .slice()
+    .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.size - a.size);
+
+  return (
+    <div className="fam-body">
+      <div className="fam-hd">
+        <h2>家族<em>{fams.length > 0 ? fams.length + ' 条弧线' : ''}</em></h2>
+        <button className={'fam-rebuild' + (busy ? ' busy' : '')} onClick={rebuild} disabled={busy}>
+          {busy ? '聚类中…' : '↻ 重建'}
+        </button>
+      </div>
+      <p className="fam-sub">
+        {data && data.updated_at
+          ? '记忆自己长出的主题弧线 · 更新于 ' + String(data.updated_at).slice(5, 16).replace('T', ' ')
+          : '记忆自己长出的主题弧线'}
+      </p>
+      {error && <div className="mood-err">{error}</div>}
+      {data && fams.length === 0 && !error && (
+        <div className="fam-empty">
+          <div className="glyph">❋</div>
+          <p>还没有家族。<br/>点右上「重建」, 让相似的记忆彼此相认。</p>
+        </div>
+      )}
+      {fams.map(f => <FamCard key={f.id} f={f} onPatch={patch}/>)}
+      <TabBar active="fam"/>
+    </div>
+  );
+}
+
 function PlaceholderScreen({ tab, ic, title, sub }) {
   return (
     <div style={{ height: '100%', position: 'relative', background: 'var(--bg)' }}>
@@ -3720,7 +3891,7 @@ function App() {
   // 深链(/mem/:id, /day/:k 等)保留. PWA 冷启动会带上次 hash, 不重置就停那儿
   useEffect(() => {
     const head = (window.location.hash || '').replace(/^#\/?/, '').split('/')[0];
-    if (['review', 'cal', 'setting'].includes(head)) {
+    if (['review', 'cal', 'setting', 'fam'].includes(head)) {
       window.location.hash = '#/';
     }
   }, []);
@@ -3740,6 +3911,8 @@ function App() {
       return <MemFullScreen id={rest[0] || ''}/>;
     case 'review':
       return <ReviewScreen/>;
+    case 'fam':
+      return <FamiliesScreen/>;
     case 'cal':
       return <CalScreen/>;
     case 'setting':

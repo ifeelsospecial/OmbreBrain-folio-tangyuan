@@ -50,7 +50,10 @@ from dehydrator import Dehydrator
 from decay_engine import DecayEngine
 from embedding_engine import EmbeddingEngine
 from import_memory import ImportEngine
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text
+
+# 后台补账任务的强引用(防 GC 早收), 完成即自清
+_BG_TASKS: set = set()
 
 # --- Load config & init logging / 加载配置 & 初始化日志 ---
 config = load_config()
@@ -63,6 +66,8 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 embedding_engine = EmbeddingEngine(config)            # Embedding engine / 向量化引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
+from families import FamilyManager
+family_mgr = FamilyManager(bucket_mgr.base_dir, embedding_engine, bucket_mgr, dehydrator)  # 记忆家族/归纳层
 
 # --- /api/buckets in-memory cache / 内存级缓存 ---
 # 每个视图(cells/network/console/mobile)启动都自己拉一遍 /api/buckets,
@@ -831,9 +836,13 @@ async def breath(
 
     results = []
     token_used = 0
-    for bucket in matches:
-        if token_used >= max_tokens:
-            break
+
+    # --- 浮现结果分波并发脱水(对齐上游 2.5.0 性能): 每波 4 条并发, 波间检查 token 预算 ---
+    # 旧串行语义"预算用完就不再调 LLM"保留在波粒度: 最多为最后一波多付 ≤3 次脱水调用
+    # (且进脱水缓存, 下次命中复用), 不会像全量 gather 那样为被裁剪的结果整批白付。
+    _DEHYDRATE_WAVE = 4
+
+    async def _dehydrate_one(bucket):
         try:
             clean_meta = {k: v for k, v in bucket["metadata"].items() if k != "tags"}
             # --- Memory reconstruction: shift displayed valence by current mood ---
@@ -842,20 +851,46 @@ async def breath(
                 original_v = float(clean_meta.get("valence") or 0.5)
                 shift = (q_valence - 0.5) * 0.2  # ±0.1 max shift
                 clean_meta["valence"] = max(0.0, min(1.0, original_v + shift))
-            summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+            return await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+        except Exception as e:
+            logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
+            return None
+
+    touched_ids = []
+    budget_hit = False
+    for _wave_start in range(0, len(matches), _DEHYDRATE_WAVE):
+        if budget_hit:
+            break
+        wave = matches[_wave_start:_wave_start + _DEHYDRATE_WAVE]
+        summaries = await asyncio.gather(*(_dehydrate_one(b) for b in wave))
+        for bucket, summary in zip(wave, summaries):
+            if summary is None:
+                continue
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
+                budget_hit = True
                 break
-            await bucket_mgr.touch(bucket["id"])
+            touched_ids.append(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             results.append(summary)
             token_used += summary_tokens
-        except Exception as e:
-            logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
-            continue
+
+    # --- touch 移出响应路径(对齐上游 2.5.0): 后台补账, 不阻塞 breath 返回 ---
+    # 语义保留: last_active / activation_count / 时间涟漪照旧(上游砍了涟漪, 这里不砍 —
+    # 涟漪读全库已走 list_all 缓存, 后台成本可接受)。
+    if touched_ids:
+        async def _touch_batch(ids=tuple(touched_ids)):
+            for bid in ids:
+                try:
+                    await bucket_mgr.touch(bid)
+                except Exception as e:
+                    logger.warning(f"background touch failed / 后台补账 touch 失败: {bid}: {e}")
+        _task = asyncio.create_task(_touch_batch())
+        _BG_TASKS.add(_task)
+        _task.add_done_callback(_BG_TASKS.discard)
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
@@ -1241,6 +1276,45 @@ async def trace(
 
 
 # =============================================================
+# Tool: source — 查看一条记忆的对话原文 (metadata.raw_source)
+# 原文由记忆写入侧逐字保存(或用户手动补), 想核对"当时原话"时按需拉,
+# 不进自动注入/浮现 — 上下文不因此膨胀。
+# =============================================================
+@mcp.tool()
+async def source(bucket_id: str = "", name: str = "") -> str:
+    """查看一条记忆的对话原文(当时对话的逐字记录)。想核对「当时原话怎么说的/具体细节」时用: 传 bucket_id, 或传记忆名 name(精确匹配优先, 唯一的模糊命中也认)。原文较长, 需要核对时才调, 别随手翻。"""
+    bucket = None
+    if bucket_id and bucket_id.strip():
+        bucket = await bucket_mgr.get(bucket_id.strip())
+        if not bucket:
+            return f"未找到记忆桶: {bucket_id}"
+    elif name and name.strip():
+        q = name.strip()
+        buckets = await bucket_mgr.list_all(include_archive=True)
+        exact = [b for b in buckets if b.get("metadata", {}).get("name", "") == q]
+        if len(exact) == 1:
+            bucket = exact[0]
+        else:
+            fuzzy = [b for b in buckets if q in b.get("metadata", {}).get("name", "")]
+            if len(fuzzy) == 1:
+                bucket = fuzzy[0]
+            elif len(fuzzy) > 1:
+                names = "、".join(b["metadata"].get("name", "?") for b in fuzzy[:8])
+                return f"「{q}」命中 {len(fuzzy)} 条, 说清楚一点或用 bucket_id: {names}"
+            else:
+                return f"没有名字含「{q}」的记忆。"
+    else:
+        return "请传 bucket_id 或记忆名 name。"
+
+    meta = bucket.get("metadata", {})
+    raw = str(meta.get("raw_source", "") or "").strip()
+    bname = meta.get("name", bucket.get("id", "?"))
+    if not raw:
+        return f"「{bname}」没有存原文 — 这条记忆写入时没带对话记录(老记忆可能还没补齐)。"
+    return f"「{bname}」的对话原文:\n\n{raw}"
+
+
+# =============================================================
 # Tool 5: pulse — Heartbeat, system status + memory listing
 # 工具 5：pulse — 脉搏，系统状态 + 记忆列表
 # =============================================================
@@ -1465,11 +1539,7 @@ def _read_runtime_config():
 
 def _write_runtime_config(rc: dict):
     p = _runtime_config_path()
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        _json_cfg.dump(rc, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, p)
+    atomic_write_text(p, _json_cfg.dumps(rc, ensure_ascii=False, indent=2))
 
 def _mask_key(k: str) -> str:
     if not k or len(k) < 12:
@@ -1754,6 +1824,98 @@ async def api_recent_searches(request):
         return JSONResponse({"items": items})
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/search-log", methods=["GET"])
+async def api_search_log(request):
+    """持久检索日志 (search_log.jsonl) 的最后 N 条, newest first。
+    与 /api/recent-searches 的区别: 那个是内存 deque(重启即失, query 截 80 字),
+    这个落盘长期攒(query 留 200 字, 带 caller 标注) — 评测集原料从这里挑。
+    Query param: limit (默认 100, 上限 1000)。"""
+    from starlette.responses import JSONResponse
+    try:
+        limit = int(request.query_params.get("limit", "100"))
+    except ValueError:
+        limit = 100
+    try:
+        items = bucket_mgr.read_search_log(limit=limit)
+        return JSONResponse({"count": len(items), "items": items})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ============================================================
+# 记忆家族/归纳层 (2026-07-06 P1) — 纯派生索引: 原始桶零接触, 整体可重算。
+# 设计稿=记忆库优化/07-家族层设计稿; 前端=v2/mobile「家族」tab。
+# ============================================================
+
+# 自动重建循环的惰性启动(FastMCP 无 startup 钩子, 从热路由里拉起一次)。
+# 阀门: FAMILIES_AUTO_REBUILD=off 关闭。
+_family_auto_started = False
+
+def _ensure_family_auto_rebuild():
+    global _family_auto_started
+    if _family_auto_started:
+        return
+    if os.environ.get("FAMILIES_AUTO_REBUILD", "on").strip().lower() == "off":
+        _family_auto_started = True
+        return
+    try:
+        import asyncio
+        asyncio.get_running_loop().create_task(family_mgr.auto_rebuild_loop())
+        _family_auto_started = True
+        logger.info("[families] auto-rebuild loop started (lazy, 写入事件去抖同步)")
+    except RuntimeError:
+        pass  # 没有运行中的 loop(理论上不会到这), 下次再试
+
+
+@mcp.custom_route("/api/families", methods=["GET"])
+async def api_families(request):
+    """家族列表(含她的编辑态)。?include_dissolved=true 连解散的也回。"""
+    from starlette.responses import JSONResponse
+    _ensure_family_auto_rebuild()
+    state = family_mgr.load()
+    fams = state.get("families", [])
+    if request.query_params.get("include_dissolved", "false").lower() != "true":
+        fams = [f for f in fams if not f.get("dissolved")]
+    return JSONResponse({
+        "updated_at": state.get("updated_at", ""),
+        "params": state.get("params", {}),
+        "rebuilding": family_mgr.rebuilding,
+        "families": fams,
+    })
+
+
+@mcp.custom_route("/api/families/rebuild", methods=["POST"])
+async def api_families_rebuild(request):
+    """全量重算: 平均连接聚类 + LLM(dehydrator 同款客户端)起名写弧线摘要。
+    她的改名/钉住/解散按成员重叠(Jaccard≥0.5)继承。可选 body {threshold}。"""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        threshold = float((body or {}).get("threshold") or 0.75)
+    except (TypeError, ValueError):
+        threshold = 0.75
+    result = await family_mgr.rebuild(threshold=threshold)
+    return JSONResponse(result, status_code=200 if result.get("ok") else 500)
+
+
+@mcp.custom_route("/api/family/{fid}", methods=["POST"])
+async def api_family_update(request):
+    """她的编辑入口: body 可含 name / pinned / dissolved。"""
+    from starlette.responses import JSONResponse
+    fid = request.path_params["fid"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    fam = family_mgr.update_family(fid, body or {})
+    if fam is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "family": fam})
 
 
 # =============================================================
@@ -2851,7 +3013,8 @@ async def api_diagnose_bucket(request):
         try:
             import frontmatter
             post = frontmatter.load(h["path"])
-            meta = dict(post.metadata)
+            # 直读路径也做时间字段归一(对齐上游 2.4.4): YAML datetime 对象直接进 JSONResponse 会 500
+            meta = bucket_mgr._normalize_meta_datetimes(dict(post.metadata))
             content = post.content or ""
             entry["loaded"] = True
             entry["metadata"] = {
@@ -3160,7 +3323,12 @@ async def api_search(request):
         limit = int(request.query_params.get("limit", "20"))
     except ValueError:
         limit = 20
-    include_vector = request.query_params.get("include_vector", "false").lower() == "true"
+    # include_vector: 'false'(默认) / 'true'(总是跑) / 'fallback'(关键词优先、语义兜底 —
+    # 关键词已有"钩子字段强命中"(title/tag/summary 命中且 score≥85)就跳过向量, 省掉
+    # 每轮 1-4 秒的 query embedding 调用; 关键词弱/空才让语义通道兜底)
+    _iv_raw = request.query_params.get("include_vector", "false").lower()
+    include_vector = _iv_raw == "true"
+    vector_fallback = _iv_raw == "fallback"
     # 默认排除噪声(resolved+importance=1, 用户软删除态);
     # 调试/查找意图时可 include_noise=true opt-in 拉回
     include_noise = request.query_params.get("include_noise", "false").lower() == "true"
@@ -3173,6 +3341,7 @@ async def api_search(request):
     exclude_pinned = request.query_params.get("exclude_pinned", "false").lower() == "true"
     # simulate=true: 即时模拟(浮现观测页用) —— 不记命中统计、不进最近搜索, 纯 dry-run 看"会检索到什么"
     simulate = request.query_params.get("simulate", "false").lower() == "true"
+    _ensure_family_auto_rebuild()  # 惰性拉起家族自动重建循环(注入每轮都经过这里)
 
     def _is_noise(meta):
         return bool(meta.get("resolved", False) and meta.get("importance", 5) == 1)
@@ -3183,9 +3352,12 @@ async def api_search(request):
     def _is_pinned(meta):
         return is_highlighted(meta) or is_protected(meta)
 
+    # caller: 调用来源标注(auto-inject / eval / dashboard...), 进检索日志区分流量
+    caller = (request.query_params.get("caller", "") or "")[:32]
+
     try:
         # === 关键词通道 ===
-        matches = await bucket_mgr.search(query, limit=limit, record_stats=not simulate)
+        matches = await bucket_mgr.search(query, limit=limit, record_stats=not simulate, caller=caller)
         if not include_noise:
             matches = [b for b in matches if not _is_noise(b.get("metadata", {}))]
         if not include_feel:
@@ -3212,8 +3384,17 @@ async def api_search(request):
 
         # === 向量通道(可选) — 排除已在 keyword_hits 里的桶,避免重复 ===
         # search_similar 返回 list[tuple[bucket_id, similarity]],不是 dict
+        # fallback 模式: 关键词已有钩子字段强命中 → 语义兜底没必要, 跳过省时延
+        # 2026-07-09 收紧: 旧条件(任意钩子字段≥85)被 fuzzy 长句分数通胀骗过 —
+        # 生产实锤"括约肌→小菊花梗"语义鸿沟查询被无关的85分tag命中堵死向量。
+        # 现在只有 title 字段本身 ≥90(近乎真标题命中)才有资格省掉向量兜底。
+        _kw_strong = any(
+            (h.get("field_scores") or {}).get("title", 0) >= 90
+            for h in keyword_hits
+        )
+        run_vector = include_vector or (vector_fallback and not _kw_strong)
         vector_hits = []
-        if include_vector and embedding_engine is not None:
+        if run_vector and embedding_engine is not None:
             try:
                 kw_ids = {h["id"] for h in keyword_hits}
                 vec_results = await embedding_engine.search_similar(query, top_k=10)
@@ -3247,6 +3428,9 @@ async def api_search(request):
             "query": query,
             "keyword_hits": keyword_hits,
             "vector_hits": vector_hits,
+            # 观测字段: fallback 调参用 — vector_ran=false 且 mode=fallback 说明关键词强命中兜住了
+            "vector_mode": _iv_raw,
+            "vector_ran": bool(run_vector and embedding_engine is not None),
         })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -3834,8 +4018,10 @@ async def api_config_update(request):
             if "merge_threshold" in body:
                 save_config["merge_threshold"] = int(body["merge_threshold"])
 
-            with open(config_path, "w", encoding="utf-8") as f:
-                yaml.dump(save_config, f, default_flow_style=False, allow_unicode=True)
+            atomic_write_text(
+                config_path,
+                yaml.dump(save_config, default_flow_style=False, allow_unicode=True),
+            )
             updated.append("persisted_to_yaml")
         except Exception as e:
             return JSONResponse({"error": f"persist failed: {e}", "updated": updated}, status_code=500)

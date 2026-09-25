@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from utils import count_tokens_approx, now_iso
+from utils import count_tokens_approx, now_iso, clean_llm_json, atomic_write_text
 
 logger = logging.getLogger("ombre_brain.import")
 
@@ -391,11 +391,7 @@ class ImportState:
     def save(self):
         """Persist state to file."""
         self.data["updated_at"] = now_iso()
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        tmp = self.state_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, self.state_file)
+        atomic_write_text(self.state_file, json.dumps(self.data, ensure_ascii=False, indent=2))
 
     def reset(self, source_file: str, source_hash: str, total_chunks: int):
         """Reset state for a new import."""
@@ -915,6 +911,13 @@ class ImportEngine:
             items = json.loads(cleaned)
         except (json.JSONDecodeError, IndexError, ValueError):
             pass
+
+        # 2.5) clean_llm_json: 抠第一个平衡 JSON 值(对齐上游 2.4.6, 与 dehydrator 共用)
+        if items is None:
+            try:
+                items = json.loads(clean_llm_json(cleaned))
+            except (json.JSONDecodeError, IndexError, ValueError):
+                pass
 
         # 3) 兜底:找第一个 [ 到最后一个 ] 截取(应对前言 / 后语 / 混合内容)
         if items is None:
