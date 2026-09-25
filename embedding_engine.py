@@ -14,12 +14,15 @@
 import os
 import json
 import math
+import hashlib
 import sqlite3
 import logging
 import asyncio
+from urllib.parse import urlparse
 from collections import OrderedDict
 from pathlib import Path
 
+import numpy as np
 from openai import AsyncOpenAI
 
 from utils import coerce_bool, positive_float
@@ -41,13 +44,34 @@ class EmbeddingEngine:
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
 
+        self.api_format = str(
+            os.environ.get("OMBRE_EMBED_FORMAT") or embed_cfg.get("api_format") or "openai_compat"
+        ).strip().lower()
+        is_local = self.api_format in {"ollama", "local"}
+
         # 优先用 embedding 独立的 api_key / base_url(env: OMBRE_EMBED_API_KEY / OMBRE_EMBED_BASE_URL),
         # 没配就 fallback 到 dehydration 的(常见情况:同一家 Gemini key 跑 dehydration + embedding)。
         # 重要:dehydration 用 deepseek/openrouter 等其他家时,这里必须独立配 Gemini key,
         # 否则用别家的 key 调 gemini-embedding-001 会一直 401/404 静默失败。
-        self.api_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
-        self.base_url = embed_cfg.get("base_url") or dehy_cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai/"
-        self.model = embed_cfg.get("model", "gemini-embedding-001")
+        cloud_key = embed_cfg.get("api_key") or dehy_cfg.get("api_key", "")
+        configured_base = str(embed_cfg.get("base_url") or "").strip()
+        configured_model = str(embed_cfg.get("model") or "").strip()
+        if is_local:
+            # Never forward a retained cloud secret to a local/user-supplied
+            # Ollama endpoint. AsyncOpenAI requires a non-empty placeholder.
+            self.api_key = "ollama"
+            local_default = "http://host.docker.internal:11434/v1" if os.path.exists("/.dockerenv") else "http://127.0.0.1:11434/v1"
+            local_env = os.environ.get("OMBRE_OLLAMA_URL", "").strip()
+            host = (urlparse(configured_base).hostname or "").lower()
+            configured_is_cloud = configured_base.startswith("https://") or any(
+                marker in host for marker in ("googleapis.com", "siliconflow", "openai.com", "dashscope")
+            )
+            self.base_url = local_env or ("" if configured_is_cloud else configured_base) or local_default
+            self.model = configured_model if configured_model and "gemini" not in configured_model.lower() else "bge-m3"
+        else:
+            self.api_key = cloud_key
+            self.base_url = configured_base or dehy_cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai/"
+            self.model = configured_model or "gemini-embedding-001"
         # coerce_bool: YAML 里写成带引号的 "false" 也不误开(对齐上游 2.5.3)
         self.enabled = bool(self.api_key) and coerce_bool(embed_cfg.get("enabled"), default=True)
         # embedding 请求超时可配(对齐上游 2.4.5):
@@ -98,12 +122,32 @@ class EmbeddingEngine:
             conn.execute("ALTER TABLE embeddings ADD COLUMN model TEXT DEFAULT ''")
         except sqlite3.OperationalError:
             pass  # 列已存在
+        try:
+            conn.execute("ALTER TABLE embeddings ADD COLUMN content_hash TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
         conn.close()
 
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        """Treat registry aliases such as ``bge-m3`` and ``bge-m3:latest`` equally."""
+        normalized = (model or "").strip().lower()
+        return normalized[:-7] if normalized.endswith(":latest") else normalized
+
+    def _model_identity(self) -> str:
+        return f"{(self.base_url or '').rstrip('/')}|{self._normalize_model_name(self.model)}"
+
     def _model_matches(self, stored_model: str) -> bool:
-        """空值(老库)按 _LEGACY_MODEL 归属; 只有与当前模型一致的向量才可用。"""
-        return (stored_model or self._LEGACY_MODEL) == self.model
+        """兼容老库模型名；新写入同时绑定 endpoint，避免跨供应商混算。"""
+        stored = stored_model or self._LEGACY_MODEL
+        if "|" in stored:
+            stored_base, stored_name = stored.rsplit("|", 1)
+            return (
+                stored_base.rstrip("/") == (self.base_url or "").rstrip("/")
+                and self._normalize_model_name(stored_name) == self._normalize_model_name(self.model)
+            )
+        return self._normalize_model_name(stored) == self._normalize_model_name(self.model)
 
     def _query_text(self, query: str) -> str:
         """查询侧文本预处理 — Qwen3-Embedding 系官方用法: 查询要带 instruction
@@ -130,7 +174,7 @@ class EmbeddingEngine:
             embedding = await self._generate_embedding(content)
             if not embedding:
                 return False
-            self._store_embedding(bucket_id, embedding)
+            self._store_embedding(bucket_id, embedding, content)
             return True
         except Exception as e:
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
@@ -141,7 +185,7 @@ class EmbeddingEngine:
         # Truncate to avoid token limits
         truncated = text[:2000]
         # LRU 命中: 同一模型同一文本的向量恒定, 不再重打 API(对齐上游 2.4.13)
-        cache_key = f"{self.model}:{truncated}"
+        cache_key = f"{self._model_identity()}:{truncated}"
         cached = self._embed_cache.get(cache_key)
         if cached is not None:
             self._embed_cache.move_to_end(cache_key)
@@ -163,13 +207,20 @@ class EmbeddingEngine:
             logger.warning(f"Embedding API call failed: {e}")
             return []
 
-    def _store_embedding(self, bucket_id: str, embedding: list[float]):
+    def _store_embedding(self, bucket_id: str, embedding: list[float], content: str = ""):
         """Store embedding in SQLite (带生成模型名)."""
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at, model) VALUES (?, ?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso(), self.model),
+            "INSERT OR REPLACE INTO embeddings "
+            "(bucket_id, embedding, updated_at, model, content_hash) VALUES (?, ?, ?, ?, ?)",
+            (
+                bucket_id,
+                json.dumps(embedding),
+                now_iso(),
+                self._model_identity(),
+                hashlib.sha256((content or "").encode("utf-8")).hexdigest(),
+            ),
         )
         conn.commit()
         conn.close()
@@ -180,6 +231,34 @@ class EmbeddingEngine:
         conn.execute("DELETE FROM embeddings WHERE bucket_id = ?", (bucket_id,))
         conn.commit()
         conn.close()
+
+    def list_all_ids(self) -> list[str]:
+        """Return IDs indexed by the currently configured provider/model."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model FROM embeddings").fetchall()
+        conn.close()
+        return [bucket_id for bucket_id, model in rows if self._model_matches(model)]
+
+    def list_content_ids(self) -> list[str]:
+        """Return current-model rows that contain a real content vector."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model, embedding FROM embeddings").fetchall()
+        conn.close()
+        return [
+            bucket_id for bucket_id, model, embedding in rows
+            if self._model_matches(model) and str(embedding or "").strip() not in {"", "[]"}
+        ]
+
+    def list_content_hashes(self) -> dict[str, str]:
+        """Return exact-content identities for current-model vectors."""
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, model, content_hash FROM embeddings").fetchall()
+        conn.close()
+        return {
+            bucket_id: str(digest or "")
+            for bucket_id, model, digest in rows
+            if self._model_matches(model)
+        }
 
     async def get_embedding(self, bucket_id: str) -> list[float] | None:
         """Retrieve stored embedding for a bucket.
@@ -202,16 +281,19 @@ class EmbeddingEngine:
         Returns list of (bucket_id, similarity_score) sorted by score desc.
         搜索与查询文本相似的桶。返回 (bucket_id, 相似度分数) 列表。
         """
-        if not self.enabled:
-            return []
-
         try:
-            query_embedding = await self._generate_embedding(self._query_text(query))
-            if not query_embedding:
-                return []
+            return await self.search_similar_strict(query, top_k=top_k)
         except Exception as e:
             logger.warning(f"Query embedding failed: {e}")
             return []
+
+    async def search_similar_strict(self, query: str, top_k: int = 10) -> list[tuple[str, float]]:
+        """Semantic search that exposes provider failures to diagnostic callers."""
+        if not self.enabled:
+            raise RuntimeError("embedding is disabled")
+        query_embedding = await self._generate_embedding(self._query_text(query))
+        if not query_embedding:
+            raise RuntimeError("embedding provider returned an empty query vector")
 
         # Load all embeddings from SQLite (只取当前模型的向量 — 跨模型不可混算)
         conn = sqlite3.connect(self.db_path)
@@ -221,20 +303,44 @@ class EmbeddingEngine:
         if not rows:
             return []
 
-        # Calculate cosine similarity
-        results = []
+        ordered_ids = []
+        scores: list[float | None] = []
+        vectors = []
+        vector_owners = []
+        query_dim = len(query_embedding)
         for bucket_id, emb_json, stored_model in rows:
             if not self._model_matches(stored_model):
                 continue
+            owner = len(ordered_ids)
+            ordered_ids.append(bucket_id)
+            scores.append(None)
             try:
                 stored_embedding = json.loads(emb_json)
-                sim = self._cosine_similarity(query_embedding, stored_embedding)
-                results.append((bucket_id, sim))
-            except (json.JSONDecodeError, Exception):
+                if not isinstance(stored_embedding, list) or not stored_embedding:
+                    continue
+                stored_embedding = [float(value) for value in stored_embedding]
+            except (json.JSONDecodeError, TypeError, ValueError):
                 continue
+            if len(stored_embedding) != query_dim:
+                scores[owner] = 0.0
+                continue
+            vectors.append(stored_embedding)
+            vector_owners.append(owner)
 
+        if vectors:
+            similarities = self._cosine_similarity_batch(query_embedding, vectors)
+            for owner, similarity in zip(vector_owners, similarities):
+                scores[owner] = float(similarity)
+
+        results = [
+            (bucket_id, score)
+            for bucket_id, score in zip(ordered_ids, scores)
+            if score is not None
+        ]
+
+        # Stable sort preserves SQLite row order for equal scores.
         results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        return results[:max(0, int(top_k))]
 
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -247,3 +353,17 @@ class EmbeddingEngine:
         if norm_a == 0 or norm_b == 0:
             return 0.0
         return dot / (norm_a * norm_b)
+
+    @staticmethod
+    def _cosine_similarity_batch(query: list[float], vectors: list[list[float]]) -> "np.ndarray":
+        """Calculate equally-sized cosine similarities in one NumPy matrix pass."""
+        query_array = np.asarray(query, dtype=np.float64)
+        matrix = np.asarray(vectors, dtype=np.float64)
+        dots = matrix @ query_array
+        denominator = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_array)
+        return np.divide(
+            dots,
+            denominator,
+            out=np.zeros_like(dots),
+            where=denominator != 0,
+        )

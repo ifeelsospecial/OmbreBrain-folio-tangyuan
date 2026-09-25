@@ -71,6 +71,8 @@
       time: time,
       title: b.name || b.id,
       summary: b.summary || '',           // 用户没填就空,前端按"无摘要不显示"渲染
+      why_remembered: b.why_remembered || '',
+      meaning: Array.isArray(b.meaning) ? b.meaning : [],
       preview: b.content_preview || '',  // 始终是 content 自动截断,给"显示原文"的视图当兜底用
       body: '',  // 列表 endpoint 不返回 content;打开详情时再 lazy-load
       importance: b.importance || 5,
@@ -86,8 +88,10 @@
       highlight: !!b.highlight,
       internalized: !!(b.internalized || b.digested),
       created_by: b.created_by || '',  // 来源 user/ai/import (空 = 历史默认 ai)
+      source_tool: b.source_tool || '',
+      grow_batch_id: b.grow_batch_id || '',
       domain: Array.isArray(b.domain) ? b.domain.filter(Boolean) : [],
-      artifacts: [],
+      artifacts: Array.isArray(b.media) ? b.media : [],
       _hasEventTime: hasEvent,
     };
   };
@@ -110,12 +114,12 @@
   // 全字段搜索(标题 / 摘要 / 标签 / 域 / 完整正文) —— 调 /api/search 拿后端 fuzz 命中
   // 默认 include_vector=false:只返回真的"含 query"的桶,不掺向量(语义)结果,
   //   避免出现 title/summary/body 都不含 query 但因语义相近被混进结果的污染情况
-  // 返回 { keyword_hits: [{id, name, score, matched_in: ['title'|'summary'|'tag'|'domain'|'content'], ...}], vector_hits: [] }
+  // 返回 { keyword_hits, vector_hits, vector_status, vector_notice };语义服务失败时必须显式呈现降级状态
   // 调用方拿到 ids 集合作为白名单过滤本地 items;matched_in 给 UI 标"命中: 正文"用
   window.__obSearch = async function (query, opts) {
     opts = opts || {};
     var q = (query || '').trim();
-    if (!q) return { query: '', keyword_hits: [], vector_hits: [] };
+    if (!q) return { query: '', keyword_hits: [], vector_hits: [], vector_status: 'not-requested', vector_notice: '' };
     var params = new URLSearchParams({ q: q, limit: String(opts.limit || 50) });
     if (opts.includeVector) params.set('include_vector', 'true');
     var r = await fetch('/api/search?' + params.toString(), { credentials: 'same-origin' });
@@ -140,6 +144,8 @@
       event_time: eventTime,
     };
     if (entry.summary) body.summary = entry.summary;  // 后端 /api/bucket/create 读 summary
+    if (entry.why_remembered) body.why_remembered = entry.why_remembered;
+    if (entry.meaning) body.meaning = entry.meaning;
     if (entry.feel) {
       body.type = 'feel';     // 关键: 让后端 metadata.type='feel', 否则 isFeel() 永远 false
       body.valence = 0.6;
@@ -168,6 +174,8 @@
     if (patch.title != null) body.name = patch.title;
     if (patch.body != null) body.content = patch.body;
     if (patch.summary != null) body.summary = patch.summary;
+    if (patch.why_remembered != null) body.why_remembered = patch.why_remembered;
+    if (patch.meaning != null) body.meaning = patch.meaning;
     if (patch.raw_source != null) body.raw_source = patch.raw_source;  // 原文片段(用户手动补全)
     if (patch.created_by != null) body.created_by = patch.created_by;  // 来源 user/ai/import
     if (patch.importance != null) body.importance = patch.importance;
