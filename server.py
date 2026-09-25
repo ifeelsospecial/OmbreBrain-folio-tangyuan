@@ -818,7 +818,70 @@ async def _merge_or_create(
     return bucket_id, False
 
 
-async def _surface_catalog(domain_filter: list | None = None, max_tokens: int = 10000) -> str:
+# ---------------------------------------------------------------
+# 日期范围过滤 (对齐上游 3.6.0 date_from/date_to, 五条分支统一处理)
+# 事件时间优先: 有 event_time 用它(本 fork 特有字段, 更接近"这件事发生在哪天"), 否则用 created。
+# 读不出时间的桶在给了范围时【排除】而非放行: 调用方明说"只要这段时间的", 静默多给等于破坏约定。
+# 核心准则/永久参考不受时间过滤: 它们是准则, 不是那段时间里发生的事(有意的不对称)。
+# ---------------------------------------------------------------
+class _DateRangeError(ValueError):
+    pass
+
+
+def _parse_date_range(date_from: str = "", date_to: str = ""):
+    """返回 (lo, hi) naive UTC datetime 或 None。纯日期的 date_to 包含当天全天。非法输入抛 _DateRangeError。"""
+    from datetime import timedelta as _td
+    from utils import parse_iso_datetime as _parse
+
+    def _one(raw, is_end):
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        try:
+            value = _parse(text)
+        except (TypeError, ValueError):
+            raise _DateRangeError(f"日期格式不对: {text}（用 YYYY-MM-DD 或 ISO 时间）")
+        if is_end and re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            value = value + _td(days=1) - _td(microseconds=1)
+        return value
+
+    lo, hi = _one(date_from, False), _one(date_to, True)
+    if lo and hi and lo > hi:
+        raise _DateRangeError("date_from 晚于 date_to。")
+    return lo, hi
+
+
+def _bucket_in_date_range(meta: dict, lo, hi) -> bool:
+    if lo is None and hi is None:
+        return True
+    from utils import parse_iso_datetime as _parse
+    for key in ("event_time", "created"):
+        raw = (meta or {}).get(key)
+        if not raw:
+            continue
+        try:
+            when = _parse(raw)
+        except (TypeError, ValueError):
+            continue
+        return (lo is None or when >= lo) and (hi is None or when <= hi)
+    return False
+
+
+def _recent_slots_config() -> tuple[int, float]:
+    """浮现区给近期新桶预留的名额(对齐上游 3.6.0 surfacing.recent_slots, 默认 3 条 / 7 天)。"""
+    surf = (config.get("surfacing") or {}) if isinstance(config, dict) else {}
+    try:
+        slots = max(0, int(surf.get("recent_slots", 3)))
+    except (TypeError, ValueError):
+        slots = 3
+    try:
+        days = max(0.0, float(surf.get("recent_days", 7)))
+    except (TypeError, ValueError):
+        days = 7.0
+    return slots, days
+
+
+async def _surface_catalog(domain_filter: list | None = None, max_tokens: int = 10000, date_range=(None, None)) -> str:
     """返回活跃记忆的紧凑目录；只读元数据，不调用 LLM 或向量服务。"""
     try:
         buckets = await bucket_mgr.list_all(include_archive=False)
@@ -842,6 +905,8 @@ async def _surface_catalog(domain_filter: list | None = None, max_tokens: int = 
         meta = bucket.get("metadata") or {}
         bucket_type = meta.get("type")
         if bucket_type == "trashed" or is_internalized(meta) or _is_noise_meta(meta):
+            continue
+        if not _bucket_in_date_range(meta, *date_range):
             continue
         domains = [str(d) for d in (meta.get("domain") or []) if d]
         if filters:
@@ -907,6 +972,8 @@ async def _breath_impl(
     arousal: float = -1,
     max_results: int = 20,
     catalog: bool = False,
+    date_from: str = "",
+    date_to: str = "",
 ) -> str:
     """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量上限(默认20,最大50)。catalog=True=目录模式,只返回名称|域|重要度,不调用LLM或向量服务。"""
     embedding_outbox.ensure_started()
@@ -918,9 +985,15 @@ async def _breath_impl(
     if query_size_error:
         return query_size_error
 
+    try:
+        date_lo, date_hi = _parse_date_range(date_from, date_to)
+    except _DateRangeError as e:
+        return str(e)
+    date_filtered = date_lo is not None or date_hi is not None
+
     if catalog:
         domain_filter = [d.strip() for d in domain.split(",") if d.strip()] if domain.strip() else None
-        return await _surface_catalog(domain_filter, max_tokens=max_tokens)
+        return await _surface_catalog(domain_filter, max_tokens=max_tokens, date_range=(date_lo, date_hi))
 
     # 完整 bucket ID 表示显式读取：直接返回原文，避免脱水造成延迟或细节损失。
     # 已归档/已内化的记忆仍可显式读取；回收站内容必须先恢复。
@@ -937,10 +1010,14 @@ async def _breath_impl(
     if domain.strip().lower() == "feel":
         try:
             all_buckets = await bucket_mgr.list_all(include_archive=False)
-            feels = [b for b in all_buckets if b.get("metadata", {}).get("type") == "feel"]
+            feels = [
+                b for b in all_buckets
+                if b.get("metadata", {}).get("type") == "feel"
+                and _bucket_in_date_range(b.get("metadata", {}), date_lo, date_hi)
+            ]
             feels.sort(key=lambda b: b.get("metadata", {}).get("created", ""), reverse=True)
             if not feels:
-                return "没有留下过 feel。"
+                return "这段时间没有留下 feel。" if date_filtered else "没有留下过 feel。"
             results = []
             for f in feels:
                 created = f["metadata"].get("created", "")
@@ -1016,6 +1093,7 @@ async def _breath_impl(
             and not is_internalized(b["metadata"])
             and not b["metadata"].get("anchor", False)
             and not b["metadata"].get("dont_surface", False)
+            and _bucket_in_date_range(b["metadata"], date_lo, date_hi)
         ]
 
         logger.info(
@@ -1067,6 +1145,24 @@ async def _breath_impl(
             candidates = cold_start + non_cold
         # Hard cap: never surface more than max_results buckets
         candidates = candidates[:max_results]
+
+        # --- 近期新桶预留名额(对齐上游 3.6.0 recent_slots) ---
+        # 配额而不是改打分: 往权重里掺新近性等于把"新"和"重要"换算成同一种东西, 换算率没有正确答案。
+        # 按缺口补: 权重排序自己送进来几条近期桶就少补几条; 补进来的放在冷启动 + top1 之后, 不被 token 预算先砍掉。
+        _slots, _recent_days = _recent_slots_config()
+        if _slots and _recent_days:
+            from utils import days_since_iso as _days_since
+            def _is_recent(b):
+                return _days_since(b["metadata"].get("created", ""), fallback_days=1e9) <= _recent_days
+            _have = sum(1 for b in candidates if _is_recent(b))
+            _need = min(_slots - _have, max_results)
+            if _need > 0:
+                _chosen = {b["id"] for b in candidates}
+                _extra = [b for b in scored if b["id"] not in _chosen and _is_recent(b)][:_need]
+                if _extra:
+                    _head = len(cold_start) + 1
+                    _keep = candidates[:max(0, max_results - len(_extra))]
+                    candidates = _keep[:_head] + _extra + _keep[_head:]
 
         dynamic_results = []
         surfaced_ids = []
@@ -1147,7 +1243,7 @@ async def _breath_impl(
             is_internalized(meta)
             or _is_noise(meta)
             or meta.get("type") in ("feel", "plan", "letter", "trashed")
-        )
+        ) and _bucket_in_date_range(meta, date_lo, date_hi)
 
     try:
         matches = await bucket_mgr.search(
@@ -1189,7 +1285,8 @@ async def _breath_impl(
                                    or is_highlighted(bucket["metadata"])
                                    or is_protected(bucket["metadata"])
                                    or _is_noise(bucket["metadata"])
-                                   or bucket["metadata"].get("type") in ("feel", "plan", "letter", "trashed")):
+                                   or bucket["metadata"].get("type") in ("feel", "plan", "letter", "trashed")
+                                   or not _bucket_in_date_range(bucket["metadata"], date_lo, date_hi)):
                     bucket["score"] = round(sim_score * 100, 2)
                     bucket["vector_match"] = True
                     matches.append(bucket)
@@ -1219,7 +1316,6 @@ async def _breath_impl(
             logger.warning(f"Failed to dehydrate search result / 检索结果脱水失败: {e}")
             return None
 
-    touched_ids = []
     budget_hit = False
     for _wave_start in range(0, len(matches), _DEHYDRATE_WAVE):
         if budget_hit:
@@ -1233,7 +1329,6 @@ async def _breath_impl(
             if token_used + summary_tokens > max_tokens:
                 budget_hit = True
                 break
-            touched_ids.append(bucket["id"])
             if bucket.get("vector_match"):
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
@@ -1241,19 +1336,10 @@ async def _breath_impl(
             results.append(summary)
             token_used += summary_tokens
 
-    # --- touch 移出响应路径(对齐上游 2.5.0): 后台补账, 不阻塞 breath 返回 ---
-    # 语义保留: last_active / activation_count / 时间涟漪照旧(上游砍了涟漪, 这里不砍 —
-    # 涟漪读全库已走 list_all 缓存, 后台成本可接受)。
-    if touched_ids:
-        async def _touch_batch(ids=tuple(touched_ids)):
-            for bid in ids:
-                try:
-                    await bucket_mgr.touch(bid)
-                except Exception as e:
-                    logger.warning(f"background touch failed / 后台补账 touch 失败: {bid}: {e}")
-        _task = asyncio.create_task(_touch_batch())
-        _BG_TASKS.add(_task)
-        _task.add_done_callback(_BG_TASKS.discard)
+    # --- 检索只读(对齐上游 3.6.0): 命中不再 touch ---
+    # 此前每条命中都刷新 last_active / activation_count 并触发时间涟漪, 于是"查得勤 == 更重要":
+    # 为核对事实反复读的旧记忆权重越爬越高, 新桶挤不进浮现区。检索是"我去找它",
+    # 强化是"找到之后这条确实要紧"——后者只能读完才判断, 由 trace(bucket_id, reinforce=True) 显式完成。
 
     # --- Random surfacing: when search returns < 3, 40% chance to float old memories ---
     # --- 随机浮现：检索结果不足 3 条时，40% 概率从低权重旧桶里漂上来 ---
@@ -1330,11 +1416,18 @@ except (AttributeError, RuntimeError, TypeError, ValueError) as _breath_compat_e
 
 
 @mcp.tool()
-async def breath_search(query: str, domain: str = "", max_results: int = 20) -> str:
-    """她每条超过15字的消息，回话前无条件带 query 调一次，不判断值不值得查。按关键词检索记忆，query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
+async def breath_search(
+    query: str,
+    domain: str = "",
+    max_results: int = 20,
+    date_from: str = "",
+    date_to: str = "",
+) -> str:
+    """她每条超过15字的消息，回话前无条件带 query 调一次，不判断值不值得查。按关键词检索记忆，query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)。检索是只读的，不会让记忆变重；某条确实要紧时用 trace(bucket_id, reinforce=True)。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
     if not query or not query.strip():
         return "breath_search 需要 query。无参数浮现请用 breath()。"
-    return await _breath_impl(query=query, domain=domain, max_results=max_results)
+    return await _breath_impl(query=query, domain=domain, max_results=max_results,
+                              date_from=date_from, date_to=date_to)
 
 
 @mcp.tool()
@@ -1346,8 +1439,10 @@ async def breath_advanced(
     arousal: float = -1,
     max_results: int = 20,
     catalog: bool = False,
+    date_from: str = "",
+    date_to: str = "",
 ) -> str:
-    """高级记忆读取。domain="feel" 读你之前留下的 feel(按时间倒序)；valence/arousal 0~1 传情感坐标做情绪共鸣检索(-1 忽略)；catalog=True 目录模式，只返回 名称|域|重要度，不调用 LLM 或向量服务；max_tokens 控制返回总 token 上限(默认10000,最大20000)；max_results 返回数量上限(默认20,最大50)；domain 逗号分隔。不传 query 为浮现模式，传 query 为关键词检索。"""
+    """高级记忆读取。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)，对浮现、检索、feel、目录都生效(核心准则不受影响)。domain="feel" 读你之前留下的 feel(按时间倒序)；valence/arousal 0~1 传情感坐标做情绪共鸣检索(-1 忽略)；catalog=True 目录模式，只返回 名称|域|重要度，不调用 LLM 或向量服务；max_tokens 控制返回总 token 上限(默认10000,最大20000)；max_results 返回数量上限(默认20,最大50)；domain 逗号分隔。不传 query 为浮现模式，传 query 为关键词检索。"""
     return await _breath_impl(
         query=query,
         max_tokens=max_tokens,
@@ -1356,6 +1451,8 @@ async def breath_advanced(
         arousal=arousal,
         max_results=max_results,
         catalog=catalog,
+        date_from=date_from,
+        date_to=date_to,
     )
 
 
@@ -1716,8 +1813,9 @@ async def trace(
     media_replace=None,
     hard_delete: bool = False,
     delete_reason: str = "",
+    reinforce: bool = False,
 ) -> str:
-    """修改记忆元数据或内容。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。reinforce=True=强化这条记忆(读完之后确认它确实要紧时用;检索本身是只读的,不会让记忆变重):刷新激活时间、激活次数+1、轻微唤醒时间相邻的记忆;不能和其他修改同时用。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1733,6 +1831,34 @@ async def trace(
     bucket = await bucket_mgr.get(bucket_id)
     if not bucket:
         return f"未找到记忆桶: {bucket_id}"
+
+    # --- 显式强化(对齐上游 3.6.0 trace reinforce): 检索只读后唯一的强化入口 ---
+    # 按桶而不是按批; 带时间涟漪(一次真实的想起)。与其他字段更新互斥, 独立早返回。
+    # 不改内容, 所以放在"用户手写桶不可改"闸门之前。
+    if reinforce:
+        _other_changes = [
+            name for name, value, default in (
+                ("name", name, ""), ("domain", domain, ""), ("valence", valence, -1),
+                ("arousal", arousal, -1), ("importance", importance, -1), ("tags", tags, ""),
+                ("resolved", resolved, -1), ("protected", protected, -1), ("highlight", highlight, -1),
+                ("pinned", pinned, -1), ("internalized", internalized, -1), ("digested", digested, -1),
+                ("event_time", event_time, ""), ("content", content, ""), ("delete", delete, False),
+                ("media_append", media_append, None), ("media_remove", media_remove, ""),
+                ("why_remembered", why_remembered, ""), ("meaning_append", meaning_append, ""),
+                ("meaning_replace", meaning_replace, None), ("status", status, ""), ("weight", weight, -1),
+                ("dont_surface", dont_surface, -1), ("media_replace", media_replace, None),
+                ("hard_delete", hard_delete, False),
+            ) if value != default
+        ]
+        if _other_changes:
+            return f"reinforce 不能和其他修改同时用（同时传了: {', '.join(_other_changes)}）。先强化，再单独改。"
+        if (bucket.get("metadata") or {}).get("type") in ("trashed", "archived"):
+            return f"{bucket_id} 在回收站或归档区，先恢复再强化。"
+        await bucket_mgr.touch(bucket_id)
+        fresh = await bucket_mgr.get(bucket_id) or bucket
+        meta = fresh.get("metadata") or {}
+        return f"已强化 {meta.get('name') or bucket_id}：激活次数 {meta.get('activation_count', '?')}，时间相邻的记忆也轻轻醒了一下"
+
     if hard_delete and delete:
         return "参数冲突：delete=True 表示移入回收站；hard_delete=True 只清理测试数据，不能同时使用。"
     if hard_delete:
