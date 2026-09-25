@@ -143,3 +143,51 @@ async def test_breath_hook_carries_plans_and_that_day(srv):
     text = resp.body.decode()
     assert text.index("📅 约好的事") < text.index("🕰 一年前的今天")
     assert "周末去海边" in text and "爱丁堡" in text
+
+
+# ---- 「未分类」重新分类 ----
+
+@pytest.mark.asyncio
+async def test_reclassify_only_touches_domain_and_tags(srv, monkeypatch):
+    import reclassify
+    server, bm = srv
+
+    class _Analyzer:
+        api_available = True
+
+        async def analyze(self, content):
+            if "看不出" in content:
+                return {"domain": ["未分类"], "tags": []}
+            return {"domain": ["出行", "兴趣"], "tags": ["伦敦", "美术馆"], "suggested_name": "不该用"}
+
+    stuck = await bm.create(content="她去了伦敦的美术馆", name="原来的名字", domain=["未分类"],
+                            tags=["旧标签"], valence=0.9, arousal=0.2)
+    vague = await bm.create(content="看不出是什么", domain=["未分类"])
+    fine = await bm.create(content="本来就分好类的", domain=["居家"])
+    before = (await bm.get(stuck))["metadata"]
+    progress = {}
+    await reclassify.reclassify_uncategorized(bm, _Analyzer(), progress, pause_s=0)
+    assert progress["total"] == 2 and progress["changed"] == 1 and progress["skipped"] == 1
+    after = (await bm.get(stuck))["metadata"]
+    assert after["domain"] == ["出行", "兴趣"]
+    assert after["tags"] == ["旧标签", "伦敦", "美术馆"]
+    for key in ("name", "valence", "arousal", "last_active", "importance"):
+        assert after.get(key) == before.get(key), key          # 其他都不动, 尤其不刷新激活时间
+    assert "/出行/" in bm._find_bucket_file(stuck)
+    assert (await bm.get(vague))["metadata"]["domain"] == ["未分类"]
+    assert (await bm.get(fine))["metadata"]["domain"] == ["居家"]
+
+
+@pytest.mark.asyncio
+async def test_reclassify_endpoint_requires_ai(srv, monkeypatch):
+    server, bm = srv
+
+    class _R:
+        method = "POST"
+        query_params = {}
+    monkeypatch.setattr(server, "_RECLASSIFY", {"running": False})
+    resp = await server.api_reclassify_uncategorized(_R())
+    assert resp.status_code == 202
+    import asyncio
+    await asyncio.gather(*list(server._BG_TASKS))
+    assert "AI 接口不可用" in server._RECLASSIFY["last_error"] and server._RECLASSIFY["finished_at"]

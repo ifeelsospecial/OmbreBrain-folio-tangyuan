@@ -3503,6 +3503,38 @@ async def api_relations_backfill(request):
     return JSONResponse({**_RELATION_BACKFILL, "started": True}, status_code=202)
 
 
+# --- 「未分类」记忆重新分类(本 fork 新增) ---
+_RECLASSIFY: dict = {"running": False, "processed": 0, "total": 0, "changed": 0, "skipped": 0,
+                     "errors": 0, "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/reclassify/uncategorized", methods=["GET", "POST"])
+async def api_reclassify_uncategorized(request):
+    """GET 查进度; POST 后台启动一次: 用当前 AI 配置给 domain 为「未分类」的记忆重新分类(只改 domain/tags)。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _RECLASSIFY.get("running"):
+        return JSONResponse(dict(_RECLASSIFY))
+    from reclassify import reclassify_uncategorized
+    _RECLASSIFY.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
+
+    async def _run():
+        try:
+            await reclassify_uncategorized(bucket_mgr, dehydrator, _RECLASSIFY)
+        except Exception as e:
+            _RECLASSIFY["last_error"] = f"{type(e).__name__}: {e}"[:300]
+            logger.error(f"reclassify crashed / 重新分类中断: {e}")
+        finally:
+            _RECLASSIFY["running"] = False
+            _RECLASSIFY["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+            _invalidate_buckets_cache()
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_RECLASSIFY, "started": True}, status_code=202)
+
+
 @mcp.custom_route("/api/families", methods=["GET"])
 async def api_families(request):
     """家族列表(含她的编辑态)。?include_dissolved=true 连解散的也回。"""
