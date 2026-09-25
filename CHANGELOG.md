@@ -2,6 +2,18 @@
 
 本 fork 以快照方式发布（无版本号），条目按日期记录。上游对齐条目会标注对应的上游版本。
 
+## 2026-09-26 · 检索与浮现（对齐上游 3.6.0 / 3.0.0）
+
+- **检索只读**：`breath_search` / `breath_advanced` 的命中不再后台 `touch()`。此前每条命中都刷新 `last_active`、`activation_count += 1` 并触发时间涟漪，形成"查得勤 == 更重要"：为核对事实反复读的旧记忆权重越爬越高，新桶挤不进浮现区。recall-hook / breath-hook 本来就只记命中统计、不改权重，行为不变。
+- **新增 `trace(bucket_id, reinforce=True)`**：唯一的显式强化入口。按桶强化，带时间涟漪；与其他字段更新互斥；不改内容，所以用户手写的桶也能强化；回收站 / 归档区的桶需先恢复。
+- **日期过滤**：`breath_search` / `breath_advanced` 新增 `date_from` / `date_to`（YYYY-MM-DD 或 ISO；纯日期的 date_to 含当天全天），对检索、浮现、feel、catalog 四条分支统一生效。本 fork 优先按 `event_time`（事情发生的时间）过滤，没有才用 `created`；给了范围时读不出时间的桶排除。核心准则 / 永久参考不受时间过滤。
+- **浮现区近期名额**：新增 `surfacing.recent_slots`（默认 3）/ `surfacing.recent_days`（默认 7）。按缺口补，补进来的排在冷启动与 top1 之后，不先被 token 预算砍掉。
+- 上游"24 小时内新桶不进『久未浮现』区"不适用：本 fork 没有该区，冷启动通道本就为新建重要桶设计。
+- 修正 `trace` 对 `resolved=1` 的描述：沉底、仍可检索、之后由衰减归档；只有 resolved + importance=1（噪声）直接进归档区。
+- **新增 `feel(query)` 工具**（对齐上游 3.0.0）：按关键词找 feel，候选限定在当前视野可见的 feel 内；向量相似度 ≥ 0.65 才命中，先按相似度再按时间倒序，逐字返回；向量不可用时退回字面匹配并在首行说明。与上游不同，`breath_advanced(domain="feel")` 仍按时间列出全部 feel（开场流程在用），不强制 query。
+- **`breath_advanced(domain="plan")` 通道**（对齐上游 3.0.0 修复）：此前会落进普通浮现、返回核心准则；现在逐字列出进行中的 plan，不调 LLM。
+- 测试：新增 `tests/test_upstream_36_retrieval.py`（9 例）；已验证恢复检索 touch、关闭名额时对应用例失败。全量 137 passed, 7 skipped。
+
 ## 2026-09-25 · 合入 folio 开发分支（codex/upstream-alignment-safe-fixes @ 6619e5d, 2026-07-14 ~ 07-18）
 
 folio 作者未发正式快照的四批对齐（详见下方 07-14 / 07-15 / 07-16 / 07-17 条目）整体合入：Plan / Letter / `I` / Anchor、持久媒体附件、`why_remembered` / `meaning`、GitHub 备份校验与合并式恢复、OAuth 2.1（默认关闭）、Cloudflare Tunnel / 自更新 / 重启 / 多实例（均默认关闭）、同桶并发锁、向量批处理、语义降级提示、catalog 目录模式等。

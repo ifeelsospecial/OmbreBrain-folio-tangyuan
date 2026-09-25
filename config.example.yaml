@@ -106,6 +106,13 @@ limits:
 
 # --- Scoring weights / 检索权重参数 ---
 # total = topic(×4) + emotion(×2) + time(×1.5) + importance(×1)
+# --- 浮现 / Surfacing ---
+# breath() 浮现区给近期新建的记忆预留位置(对齐上游 3.6.0)。按缺口补: 权重排序
+# 自己已经带进来几条近期记忆, 就少补几条。recent_slots=0 关闭。
+surfacing:
+  recent_slots: 3   # 预留几个位置
+  recent_days: 7    # "近期" = 最近几天内创建
+
 scoring_weights:
   topic_relevance: 4.0
   emotion_resonance: 2.0

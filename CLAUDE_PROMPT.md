@@ -12,11 +12,12 @@
 | 能力 | 场景 |
 |------|-----------|
 | `breath` | **每次对话最开头**调用一次（不传参数）——就像睁眼看手机，看看有没有未解决的事浮上来 |
-| `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain` 和 `max_results` |
-| `breath_advanced` | 读取 feel、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
+| `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain`、`max_results`，`date_from` / `date_to` 按事情发生的日期筛选。检索是只读的，不会让记忆变重 |
+| `breath_advanced` | 按时间翻全部 feel（`domain="feel"`）、看进行中的计划（`domain="plan"`）、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
+| `feel` | 按关键词找你以前留下的 feel：`feel(query="她搬家那天")`，只返回相关的，逐字原文 |
 | `hold` | 你想记住当下发生的单个事件，或想存储一条信息时。`feel=True` 写你的第一人称感受，`source_bucket` 指向被消化的记忆，`valence` 是你自己的感受 |
 | `grow` | 当**一天结束时**或**用户发来一大段日记/总结**时调用。你可以把其中**你想记住的事件**扔进去，它会自动拆分整理成多个记忆盒子存进你的大脑 |
-| `trace` | 当你或用户认为"这个记错了"、"帮我改一下"时调用，手动修正记忆的元数据；**某件事解决了**时用 `resolved=1` 让它沉底；**需要删除**时用 `delete=True` |
+| `trace` | 当你或用户认为"这个记错了"、"帮我改一下"时调用，手动修正记忆的元数据；**某件事解决了**时用 `resolved=1` 让它沉底；**需要删除**时用 `delete=True`；读完一条记忆、确认它**确实要紧**时用 `reinforce=True` 强化它 |
 | `source` | 想核对「当时原话怎么说的 / 具体细节」时调用：传 `bucket_id` 或记忆名 `name`，读这条记忆的对话原文。原文较长，需要核对时才调，别随手翻 |
 | `plan` | 登记待办、承诺或还没闭环的事（"我答应你…""下次要…"）；`weight` 0~1 表示它压在心头的重量。有独立生命周期，不混入普通浮现；做完或放弃时用 `trace` 改 `status` |
 | `letter_write` / `letter_read` | 写一封永久信件（原文保存，不合并、不压缩、不衰减）；`letter_read` 按关键词、署名、日期找回历史信件原文 |
@@ -55,6 +56,7 @@
 ### trace 的参数技巧
 - `resolved=1`：标记已解决，桶权重骤降到 5%，沉底等待关键词激活
 - `resolved=1` + 已消化（写过 feel）：权重骤降到 2%，加速淡化直到归档为无限小
+- `reinforce=True`：强化这条记忆。**检索是只读的**，搜到不会让记忆变重；读完之后确认它确实要紧，再单独调一次 `trace(bucket_id, reinforce=True)`。不能和其他修改一起传
 - `resolved=0`：重新激活，让它重新参与浮现排序
 - `delete=True`：彻底删除这个桶（不可恢复）
 - 其余字段（name/domain/valence/arousal/importance/tags）：只传需要改的，-1 或空串表示不改
