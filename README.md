@@ -7,11 +7,11 @@ A long-term emotional memory system for AI assistants. Tags memories using Russe
 > ### 🌿 这是一个优化分支 (an optimized fork)
 > 本项目 fork 自 **[P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain)**（原作者），已获授权开源。
 >
-> **核心记忆机制（衰减公式 / 做梦 / feel / 记忆桶 / 情感权重）与原作者完全一致、未改动。** 我在其上做的是：① 全套新前端体验 ② 一批便利功能 ③ 检索/排序的命中精度优化（尤其中文场景）。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。
+> 本项目沿用原版的记忆桶、衰减、Dream、Feel 与情绪坐标等核心概念，但已经加入独立的数据字段、检索策略、生命周期行为和前端能力，**不等同于当前上游版本**。基线与逐项差异见 [CHANGES.md](./CHANGES.md)。
 >
 > **如果你不需要这些前端/便利功能，请直接支持[原作者的版本](https://github.com/P0luz/Ombre-Brain)。**
 >
-> 📋 [CHANGES.md](./CHANGES.md) 改了什么 · 🚀 [DEPLOY.md](./DEPLOY.md) 云部署+备份 · 🔄 [MIGRATION.md](./MIGRATION.md) 从上游迁移
+> 📋 [CHANGES.md](./CHANGES.md) 改了什么 · 🚀 [DEPLOY.md](./DEPLOY.md) 云部署+备份 · 🧭 [扩展能力傻子版说明](./docs/OPTIONAL_FEATURES.md) · 🔄 [MIGRATION.md](./MIGRATION.md) 从上游迁移
 >
 > 💡 第一次接触 Ombre-Brain？记忆模型 / 衰减 / 做梦这些**核心概念建议先读[原作者的 README](https://github.com/P0luz/Ombre-Brain)**，讲得很完整；本仓的概念说明沿用其设计。
 
@@ -257,13 +257,15 @@ breath_search(query="今天很累")
     返回 ≤20 条结果
 ```
 
-6 个 MCP 工具 / 6 MCP tools:
+主要 MCP 工具（`breath` 仍兼容旧参数写法） / primary MCP tools (`breath` still accepts legacy arguments):
 
 | 工具 Tool | 作用 Purpose |
 |-----------|-------------|
-| `breath` | 浮现或检索记忆。无参数=推送未解决记忆；有参数=关键词+向量语义双通道检索。支持 domain/valence/arousal 过滤 / Surface or search memories. No args = surface unresolved; with query = keyword + vector dual-channel search. Supports domain/valence/arousal filters |
+| `breath` | 无参数浮现记忆；保持零参数以提高 MCP 按需选工具的稳定性 / Zero-argument memory surfacing |
+| `breath_search` | 日常关键词检索，可选领域和结果数 / Everyday keyword search with optional domain and result limit |
+| `breath_advanced` | 紧凑目录、feel、情绪坐标及 token 预算等高级读取 / Catalog, feel, emotion coordinates, and token-budget controls |
 | `hold` | 存储单条记忆，自动打标+合并相似桶+生成 embedding。`feel=True` 写模型自己的感受 / Store a single memory with auto-tagging, merging, and embedding. `feel=True` for model's own reflections |
-| `grow` | 日记归档，自动拆分长内容为多个记忆桶，每个桶自动生成 embedding / Diary digest, auto-split into multiple buckets with embeddings |
+| `grow` | 日记归档；可自动拆分长内容，也可用 `items=[...]` 逐字写入已拆好的多条正文 / Diary digest with automatic splitting or verbatim pre-split items |
 | `trace` | 修改元数据、标记已解决、删除 / Modify metadata, mark resolved, delete |
 | `pulse` | 系统状态 + 所有记忆桶列表 / System status + bucket listing |
 | `dream` | 对话开头自省消化——读最近记忆，有沉淀写 feel，能放下就 resolve / Self-reflection at conversation start |
@@ -305,7 +307,7 @@ export OMBRE_API_KEY="your-api-key"
 Supports any OpenAI-compatible API. Just change `base_url` and `model` in `config.yaml`.
 
 > **💡 向量化检索（Embedding）**
-> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。每次 `hold`/`grow` 存入记忆时自动生成 embedding 并存入 `embeddings.db`（SQLite）。
+> Ombre Brain 内置双通道检索：关键词匹配 + 向量语义搜索。`hold`/`grow` 会先把 Markdown 正文可靠落盘，再把 embedding 投递到耐久后台队列；供应商暂时不可用时会自动重试，不阻塞或回滚记忆写入。向量存入 `embeddings.db`（SQLite）。
 > 推荐：**Google AI Studio 的 `gemini-embedding-001`**（免费，1500 次/天，3072 维向量）。在 `config.yaml` 的 `embedding` 部分配置。
 > 不配置 embedding 也能用，系统会降级到纯 fuzzy matching 模式。
 >
@@ -399,6 +401,8 @@ All parameters in `config.yaml` (copy from `config.example.yaml`). Key ones:
 |---|---|---|
 | `transport` | `stdio`（本地）/ `streamable-http`（远程）| `stdio` |
 | `buckets_dir` | 记忆桶存储路径 / Bucket storage path | `./buckets/` |
+| `media_dir` | 持久附件目录 / Durable media path | `<buckets_dir>/_media` |
+| `media_max_bytes` | 单个附件上限 / Per-file limit | `26214400` (25 MiB) |
 | `dehydration.model` | 脱水用的 LLM 模型 / LLM model for dehydration | `deepseek-chat` |
 | `dehydration.base_url` | API 地址 / API endpoint | `https://api.deepseek.com/v1` |
 | `embedding.enabled` | 启用向量语义检索 / Enable embedding search | `true` |
@@ -412,6 +416,8 @@ Sensitive config via env vars:
 - `OMBRE_API_KEY` — LLM API 密钥
 - `OMBRE_TRANSPORT` — 覆盖传输方式
 - `OMBRE_BUCKETS_DIR` — 覆盖存储路径
+- `OMBRE_MEDIA_DIR` — 可选；附件使用独立持久盘时覆盖目录
+- `OMBRE_MEDIA_MAX_BYTES` — 可选；单个附件字节上限
 
 ## 衰减公式 / Decay Formula
 
@@ -767,9 +773,9 @@ sudo systemctl restart ombre-brain   # 示例
 
 ## 关于本 fork (About this fork)
 
-这是 [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) 的一个优化分支版本。**核心记忆机制（衰减公式 / 做梦 / feel / 记忆桶 / 情感权重）与原作者完全一致、未改动**；我主要做了前端体验、便利功能，以及检索/排序的命中精度优化（尤其中文）。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。已获得原作者授权开源。
+这是 [P0luz/Ombre-Brain](https://github.com/P0luz/Ombre-Brain) 的一个优化分支版本。它沿用原版的核心概念，但已经在字段、检索、记忆生命周期和前端能力上形成明确差异，不能视为当前上游的无修改镜像。改了哪些、为什么，全部透明列在 [CHANGES.md](./CHANGES.md)。已获得原作者授权开源。
 
-This is an optimized fork of the upstream. **The core memory mechanism (decay / dreaming / feel / bucket model / emotion weighting) is identical to upstream and unchanged** — my changes are the frontend experience, convenience features, and retrieval/ranking precision tuning (especially for Chinese). Every change is transparently listed in [CHANGES.md](./CHANGES.md). Open-sourced with the original author's permission.
+This is an optimized fork of the upstream. It preserves the original concepts, but now has explicit differences in metadata, retrieval, memory lifecycle, and frontend behavior; it is not an unchanged mirror of current upstream. Every change is transparently listed in [CHANGES.md](./CHANGES.md). Open-sourced with the original author's permission.
 
 本 fork 特有文档 / Fork-specific docs:
 

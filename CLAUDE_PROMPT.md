@@ -13,11 +13,15 @@
 |------|-----------|
 | `breath` | **每次对话最开头**调用一次（不传参数）——就像睁眼看手机，看看有没有未解决的事浮上来 |
 | `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain` 和 `max_results` |
-| `breath_advanced` | 读取 feel、情绪坐标检索或自定义 token 预算时使用 |
+| `breath_advanced` | 读取 feel、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
 | `hold` | 你想记住当下发生的单个事件，或想存储一条信息时。`feel=True` 写你的第一人称感受，`source_bucket` 指向被消化的记忆，`valence` 是你自己的感受 |
 | `grow` | 当**一天结束时**或**用户发来一大段日记/总结**时调用。你可以把其中**你想记住的事件**扔进去，它会自动拆分整理成多个记忆盒子存进你的大脑 |
 | `trace` | 当你或用户认为"这个记错了"、"帮我改一下"时调用，手动修正记忆的元数据；**某件事解决了**时用 `resolved=1` 让它沉底；**需要删除**时用 `delete=True` |
 | `source` | 想核对「当时原话怎么说的 / 具体细节」时调用：传 `bucket_id` 或记忆名 `name`，读这条记忆的对话原文。原文较长，需要核对时才调，别随手翻 |
+| `plan` | 登记待办、承诺或还没闭环的事（"我答应你…""下次要…"）；`weight` 0~1 表示它压在心头的重量。有独立生命周期，不混入普通浮现；做完或放弃时用 `trace` 改 `status` |
+| `letter_write` / `letter_read` | 写一封永久信件（原文保存，不合并、不压缩、不衰减）；`letter_read` 按关键词、署名、日期找回历史信件原文 |
+| `I` | 记录或读取你的自我认知——你对自己是谁的理解。默认不参加 breath / dream |
+| `anchor` / `release` | 把一条已有记忆设为"坐标系"（最多 24 条）：不主动浮现，但手动搜索仍能找到；`release` 解除 |
 | `pulse` | 用户想看看你都记得什么、或问记忆系统状态时调用 |
 | `dream` | **对话开头 breath 之后**调用一次——读最近的记忆，自省消化。有沉淀就写 feel，能放下的就 resolve |
 
@@ -44,7 +48,7 @@
 ### breath 工具怎么选
 - `breath()`：无参数浮现模式，推送权重最高的未解决桶（每次对话开头用这个）
 - `breath_search(query="关键词")`：普通检索；尽量用关键词而不是整句话，可传 `domain` 缩小范围
-- `breath_advanced(...)`：需要 `valence` + `arousal` 情绪共鸣、`domain="feel"` 或自定义 token 预算时使用
+- `breath_advanced(...)`：需要 `valence` + `arousal` 情绪共鸣、`domain="feel"`、`catalog=True` 或自定义 token 预算时使用
 
 检索结果不足时，系统有概率从低权重旧桶里随机漂上来 1-3 条记忆，标注为 `[surface_type: random]`。这不是检索结果，是"忽然想起来"——你可以自然地提起它，也可以忽略。
 
