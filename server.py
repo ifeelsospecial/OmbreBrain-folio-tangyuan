@@ -1717,7 +1717,7 @@ async def trace(
     hard_delete: bool = False,
     delete_reason: str = "",
 ) -> str:
-    """修改记忆元数据或内容。resolved=1归档(移入归档区→不再浮现、也不再被检索;可在 dashboard 归档区查看/恢复)/0取消归档标记,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
+    """修改记忆元数据或内容。resolved=1标记已解决(留在原处沉底:不再主动浮现,关键词检索仍能找到但排名降低,衰减加快,之后由衰减引擎自动归档;resolved=1且importance=1=标为噪声,直接移入归档区)/0重新激活,protected=1防衰减/0取消,highlight=1浮现优先/0取消,internalized=1隐藏(留在原地但不浮现/不检索)/0取消,event_time=纠正事件实际发生时间(YYYY-MM-DD 或 ISO,空字符串=清除该字段),content=替换桶正文,delete=True删除。只传需改的,-1或空=不改。pinned 是 protected+highlight 的旧组合别名;digested 是 internalized 旧名,仍可用。"""
 
     if not bucket_id or not bucket_id.strip():
         return "请提供有效的 bucket_id。"
@@ -1835,9 +1835,12 @@ async def trace(
     # 特别提示 resolved 状态变化的语义
     if "resolved" in updates:
         if updates["resolved"]:
-            changed += " → 已归档，不再参与浮现/检索（可在 dashboard 归档区查看或恢复）"
+            if updates.get("importance") == 1:
+                changed += " → 已标为噪声，移入归档区（可在 dashboard 归档区查看或恢复）"
+            else:
+                changed += " → 已沉底：不再主动浮现，关键词仍能找到，之后随衰减自动归档"
         else:
-            changed += " → 已取消归档标记，将重新参与浮现排序"
+            changed += " → 已重新激活，将重新参与浮现排序"
     if "internalized" in updates:
         if updates["internalized"]:
             changed += " → 已内化，保留但不再浮现"
