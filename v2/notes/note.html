@@ -40,7 +40,6 @@
   .ktag { font: 12.5px/1 var(--sans); display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px 6px 6px; border-radius: 999px;
     background: color-mix(in srgb, var(--pg-accent) 8%, var(--pg-paper)); border: 1px solid color-mix(in srgb, var(--pg-accent) 16%, var(--pg-line)); color: var(--pg-ink); }
   .ktag b { font-weight: 600; font-size: 11px; letter-spacing: .06em; padding: 3px 7px; border-radius: 999px; background: var(--pg-accent); color: var(--pg-paper); }
-  .ptag { font: 12.5px/1 var(--sans); padding: 6px 11px; border-radius: 999px; border: 1px solid var(--pg-line); color: var(--pg-soft); }
 
   /* 分节 */
   section.block { margin-top: 38px; }
@@ -131,8 +130,7 @@
     document.title = n.title + ' · 知识本';
     page.style.setProperty('--c', hue(n.topic));
     const cityLinks = n.cities.map(c => `<a href="/v2/map/?city=${encodeURIComponent(c)}">📍 ${esc(c)}</a>`).join('');
-    const tags = n.kind_tags.map(t => `<span class="ktag"><b>${esc(t.kind)}</b>${esc(t.name)}</span>`).join('')
-      + n.tags.map(t => `<span class="ptag">${esc(t)}</span>`).join('');
+    const tags = n.kind_tags.map(t => `<span class="ktag"><b>${esc(t.kind)}</b>${esc(t.name)}</span>`).join('');
     page.innerHTML = `
       <a class="crumb" href="./">← 回到知识本</a>
       <div class="photo rise" aria-label="照片（下一期）">

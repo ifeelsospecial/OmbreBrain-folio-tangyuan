@@ -239,6 +239,11 @@ class BucketManager:
     def _normalize_meaning_item(value) -> str:
         return str(value or "").strip()[:_MEANING_ITEM_MAX]
 
+    @staticmethod
+    def _her_note_texts(meta: dict) -> list[str]:
+        """知识本「你的笔记」(her_notes) 跟 meaning 同一档参与检索, 让他搜得到她写的笔记。"""
+        return [str(n.get("text")) for n in (meta.get("her_notes") or []) if isinstance(n, dict) and n.get("text")]
+
     @classmethod
     def _normalize_meaning_list(cls, values) -> list[str]:
         if not values:
@@ -479,7 +484,7 @@ class BucketManager:
         meta = bucket.get("metadata", {}) or {}
         name = str(meta.get("name") or "")
         summary = str(meta.get("summary") or "")
-        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []))
+        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []) + self._her_note_texts(meta))
         why_remembered = str(meta.get("why_remembered") or "")
         content = str(bucket.get("content") or "")
         domain_str = " ".join(meta.get("domain") or [])
@@ -2299,7 +2304,8 @@ class BucketManager:
         name_raw = fuzz.partial_ratio(query, meta.get("name", "") or "")
         summary_raw = fuzz.partial_ratio(query, meta.get("summary", "") or "")
         meaning_raw = max(
-            (fuzz.partial_ratio(query, value) for value in self._normalize_meaning_list(meta.get("meaning") or [])),
+            (fuzz.partial_ratio(query, value)
+             for value in self._normalize_meaning_list(meta.get("meaning") or []) + self._her_note_texts(meta)),
             default=0,
         )
         why_raw = fuzz.partial_ratio(query, meta.get("why_remembered", "") or "")

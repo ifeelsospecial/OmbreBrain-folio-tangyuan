@@ -1124,6 +1124,33 @@ def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
     return rows[:limit]
 
 
+_HER_NOTE_PREFIX_RE = re.compile(r"^她的笔记\s*(?:[（(]\s*(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*[)）])?\s*[:：]\s*")
+
+
+def _her_notes_of(meta: dict) -> list:
+    """她的笔记: 元数据 her_notes + meaning 里以"她的笔记："/"她的笔记（2026-09-30）："开头的, 按时间排(没日期的在前)。"""
+    out = []
+    for m in (meta or {}).get("meaning") or []:
+        text = str(m or "").strip()
+        hit = _HER_NOTE_PREFIX_RE.match(text)
+        if hit and text[hit.end():].strip():
+            at = f"{hit.group(1)}-{int(hit.group(2)):02d}-{int(hit.group(3)):02d}" if hit.group(1) else ""
+            out.append({"text": text[hit.end():].strip(), "at": at, "from_meaning": True})
+    for n in (meta or {}).get("her_notes") or []:
+        if isinstance(n, dict) and str(n.get("text") or "").strip():
+            out.append({"text": str(n["text"]), "at": str(n.get("at") or "")})
+    out.sort(key=lambda n: n["at"])
+    return out
+
+
+def _her_notes_block(meta: dict) -> str:
+    """breath / breath_search 返回这条记忆时一并带出她写的笔记 —— 她写就是为了让他看见。"""
+    notes = _her_notes_of(meta)
+    if not notes:
+        return ""
+    return "\n[她的笔记]\n" + "\n".join(f"- {('(' + n['at'][:10] + ') ') if n['at'] else ''}{n['text']}" for n in notes)
+
+
 def _note_row(b: dict) -> dict:
     """知识本条目的统一视图(页面与 breath 通道共用)。主题取第一个领域。"""
     meta = b.get("metadata") or {}
@@ -1140,6 +1167,7 @@ def _note_row(b: dict) -> dict:
         "id": b["id"],
         "title": meta.get("name") or strip_wikilinks(str(b.get("content") or ""))[:20],
         "content": strip_wikilinks(str(b.get("content") or "")),
+        "preview": _parse_note_body(strip_wikilinks(str(b.get("content") or "")))["about"][:400],
         "topic": domains[0] if domains else "其他",
         "tags": tags[:6],
         "day": day.isoformat() if day else "",
@@ -1153,7 +1181,6 @@ def _note_row(b: dict) -> dict:
 _NOTE_HIDDEN_TAGS = {"handbook", "知识", "讲解"}
 _JOURNEY_TAG_RE = re.compile(r"^[a-z]+[-_]?\d{4}$", re.I)   # italy2026 这类旅程标签
 _NOTE_URL_RE = re.compile(r"https?://[^\s，。、；）)\]】>\"'<]+")
-_HER_NOTE_PREFIX_RE = re.compile(r"^她的笔记\s*[:：]\s*")
 # 「类别:名字」标签 → 相关页卡片上的"为什么相关"
 _NOTE_KIND_REASON = {
     "城市": "同一座城市", "国家": "同一个国家", "地区": "同一个地区", "地点": "同一个地方", "景点": "同一个地方",
@@ -1248,7 +1275,7 @@ def _note_related(bucket: dict, knowledge: list) -> list:
     for bid, row in found.items():
         n = _note_row(by_id[bid])
         out.append({"id": bid, "title": n["title"], "topic": n["topic"], "day": n["day"],
-                    "snippet": _parse_note_body(n["content"])["about"][:80], "reasons": row["reasons"],
+                    "snippet": n["preview"][:80], "reasons": row["reasons"],
                     "_rank": row["rank"]})
     out.sort(key=lambda r: r["day"], reverse=True)
     out.sort(key=lambda r: -r["_rank"])   # 关系越多越靠前, 同分新的在前
@@ -1260,33 +1287,16 @@ def _note_related(bucket: dict, knowledge: list) -> list:
 def _note_detail(bucket: dict, knowledge: list) -> dict:
     meta = bucket.get("metadata") or {}
     row = _note_row(bucket)
-    kinds, plain = [], []
-    for t in meta.get("tags") or []:
-        if not _note_tag_visible(t):
-            continue
-        kt = _split_note_tag(t)
-        if kt:
-            kinds.append({"kind": kt[0], "name": kt[1]})
-        elif str(t) not in row["cities"] and str(t) != row["topic"]:
-            plain.append(str(t))
+    # 只显示「类别:名字」胶囊; 普通标签多是系统自动打的, 不显示
+    kinds = [{"kind": kt[0], "name": kt[1]} for t in meta.get("tags") or []
+             if _note_tag_visible(t) and (kt := _split_note_tag(t))]
     cities = list(dict.fromkeys(row["cities"] + [k["name"] for k in kinds if k["kind"] == "城市"]))
-    his, hers = [], []
-    for m in meta.get("meaning") or []:
-        text = str(m or "").strip()
-        if not text:
-            continue
-        if _HER_NOTE_PREFIX_RE.match(text):
-            hers.append({"text": _HER_NOTE_PREFIX_RE.sub("", text), "at": "", "from_meaning": True})
-        else:
-            his.append(text)
-    for n in meta.get("her_notes") or []:
-        if isinstance(n, dict) and str(n.get("text") or "").strip():
-            hers.append({"text": str(n["text"]), "at": str(n.get("at") or "")})
+    his = [t for m in meta.get("meaning") or [] if (t := str(m or "").strip()) and not _HER_NOTE_PREFIX_RE.match(t)]
     return {
         "id": row["id"], "title": row["title"], "topic": row["topic"], "day": row["day"],
-        "cities": cities, "kind_tags": kinds, "tags": plain, "mine": row["mine"],
+        "cities": cities, "kind_tags": kinds, "mine": row["mine"],
         **_parse_note_body(row["content"]),
-        "his_notes": his, "her_notes": hers,
+        "his_notes": his, "her_notes": _her_notes_of(meta),
         "related": _note_related(bucket, knowledge),
     }
 
@@ -1547,7 +1557,7 @@ async def _breath_impl(
         except Exception as e:
             logger.error(f"Knowledge retrieval failed: {e}")
             return "读取知识本失败。"
-        notes = [_note_row(b) for b in all_buckets
+        notes = [{**_note_row(b), "her": _her_notes_block(b.get("metadata") or {})} for b in all_buckets
                  if is_knowledge(b.get("metadata") or {}) and (b.get("metadata") or {}).get("type") != "trashed"
                  and _bucket_in_date_range(b.get("metadata") or {}, date_lo, date_hi)]
         if not notes:
@@ -1560,7 +1570,7 @@ async def _breath_impl(
             lines.append(f"\n【{topic}】")
             for n in sorted(by_topic[topic], key=lambda x: x["day"], reverse=True):
                 where = f"（{'、'.join(n['cities'])}）" if n["cities"] else ""
-                entry = f"· {n['title']}{where} [bucket_id:{n['id']}]\n  {n['content']}"
+                entry = f"· {n['title']}{where} [bucket_id:{n['id']}]\n  {n['content']}{n['her']}"
                 used += count_tokens_approx(entry)
                 if used > max_tokens:
                     lines.append("…（后面还有，按关键词用 breath_search 找）")
@@ -1622,7 +1632,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(_with_hint(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
+                pinned_results.append(_with_hint(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}{_her_notes_block(b['metadata'])}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
@@ -1646,7 +1656,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                protected_results.append(_with_hint(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
+                protected_results.append(_with_hint(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}{_her_notes_block(b['metadata'])}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate protected bucket / 钉决桶脱水失败: {e}")
                 continue
@@ -1741,6 +1751,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary += _her_notes_block(b["metadata"])
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
                     break
@@ -1922,6 +1933,7 @@ async def _breath_impl(
         for bucket, summary in zip(wave, summaries):
             if summary is None:
                 continue
+            summary += _her_notes_block(bucket.get("metadata"))
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 budget_hit = True
@@ -1965,7 +1977,7 @@ async def _breath_impl(
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
+                    drift_results.append(f"[surface_type: random]\n{summary}{_her_notes_block(b['metadata'])}")
                 results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")

@@ -127,7 +127,7 @@
       <article class="note paper" data-id="${esc(n.id)}" style="--c:${hue(n.topic)};animation-delay:${Math.min(i, 12) * 30}ms" tabindex="0">
         <div class="note-topic">${esc(n.topic)}</div>
         <h3 class="note-title">${highlight(n.title)}</h3>
-        <p class="note-body">${highlight(n.content)}</p>
+        <p class="note-body">${highlight(n.preview || n.content)}</p>
         <div class="note-foot"><span>${esc(n.day)}</span>
           ${n.cities.map(c => `<span class="city">· ${esc(c)}</span>`).join('')}
           ${n.mine ? '<span class="mine">by you</span>' : ''}</div>

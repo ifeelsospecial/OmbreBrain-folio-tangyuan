@@ -414,7 +414,7 @@ async def test_note_detail_tags_notes_and_related(srv):
     resp = await server.api_note_detail(_NoteReq(a))
     note = json.loads(resp.body)["note"]
     assert note["kind_tags"] == [{"kind": "城市", "name": "罗马"}, {"kind": "画家", "name": "卡拉瓦乔"}]
-    assert note["tags"] == ["巴洛克"] and "罗马" in note["cities"]
+    assert "tags" not in note and "罗马" in note["cities"]   # 普通标签(巴洛克)不显示
     assert note["his_notes"] == ["光是救赎的隐喻"]
     assert [n["text"] for n in note["her_notes"]] == ["想去圣王路易堂看原作"]
     assert note["source"]["urls"] == ["https://a.example/x"] and "来源" not in note["about"]
@@ -437,6 +437,28 @@ async def test_her_note_appends_to_metadata(srv):
     assert ok["ok"] and [x["text"] for x in hn] == ["慕尼黑也要打卡", "第二条"] and hn[0]["at"].endswith("Z")
     detail = json.loads((await server.api_note_detail(_NoteReq(k))).body)["note"]
     assert [x["text"] for x in detail["her_notes"]] == ["慕尼黑也要打卡", "第二条"]
+
+
+@pytest.mark.asyncio
+async def test_her_notes_dated_sorted_and_visible_to_him(srv):
+    server, bm = srv
+    k = await bm.create(content="卡拉瓦乔用强光打在人物脸上。\n\n叩问\n问：为什么？\n答：戏剧性。\n来源：https://x.example",
+                        name="明暗", tags=["handbook"], domain=["艺术"])
+    await bm.update(k, meaning=["他的一句话", "她的笔记（2026-09-30）：原作比画册暗很多", "她的笔记：没写日期的一条"])
+    await bm.update(k, her_notes_append={"text": "博尔盖塞要提前订票", "at": "2026-09-28T10:00:00Z"})
+    await bm.update(k, her_notes_append={"text": "十月再去一次", "at": "2026-10-02T09:00:00Z"})
+    hers = server._her_notes_of((await bm.get(k))["metadata"])
+    assert [(n["text"], n["at"][:10]) for n in hers] == [
+        ("没写日期的一条", ""), ("博尔盖塞要提前订票", "2026-09-28"),
+        ("原作比画册暗很多", "2026-09-30"), ("十月再去一次", "2026-10-02")]
+    # 列表卡片只预览「关于」
+    row = server._note_row(await bm.get(k))
+    assert row["preview"] == "卡拉瓦乔用强光打在人物脸上。"
+    # 她的笔记进检索, 且 breath_search 返回时一并带出
+    out = await server.breath_search(query="博尔盖塞")
+    assert k in out and "[她的笔记]" in out and "- (2026-09-28) 博尔盖塞要提前订票" in out and "(2026-09-30) 原作比画册暗很多" in out
+    chan = await server.breath_advanced(domain="知识")
+    assert "[她的笔记]" in chan and "十月再去一次" in chan
 
 
 @pytest.mark.asyncio
