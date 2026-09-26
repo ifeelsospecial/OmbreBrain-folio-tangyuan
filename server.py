@@ -1825,7 +1825,7 @@ async def breath_search(
     date_to: str = "",
     quotes: bool = False,
 ) -> str:
-    """按关键词检索记忆，该查才查：她提到过去（"上次""之前""还记得"）、具体的人/地方/约定，或者让你推荐、建议、帮她做决定时，回话前先查一次，一般 max_results=5 就够；闲聊和情绪回应不用查。query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)。检索是只读的，不会让记忆变重；某条确实要紧时用 trace(bucket_id, reinforce=True)。quotes=True：不只想知道当时发生了什么，还想知道当时到底是怎么说的——命中的记忆里如果存过引语，会原样附在后面；默认不给。引语是写入时挑的几句，不是全文，全文用 source。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
+    """按关键词检索记忆，该查才查：她提到过去（"上次""之前""还记得"）、具体的人/地方/约定、情绪有波动（焦虑、难过、压力大——先查她以前类似的时候是什么感受、什么能安慰到她），或者让你推荐、建议、帮她做决定时，回话前先查一次，一般 max_results=5 就够；只有"嗯""好""哈哈"这种水话不用查。query 用关键词比整句更准。domain 可选，逗号分隔缩小主题范围。max_results 返回数量上限(默认20,最大50)。date_from/date_to 按事情发生的日期筛选(YYYY-MM-DD，包含当天)。检索是只读的，不会让记忆变重；某条确实要紧时用 trace(bucket_id, reinforce=True)。quotes=True：不只想知道当时发生了什么，还想知道当时到底是怎么说的——命中的记忆里如果存过引语，会原样附在后面；默认不给。引语是写入时挑的几句，不是全文，全文用 source。读 feel、情绪坐标、目录、token 预算用 breath_advanced。"""
     if not query or not query.strip():
         return "breath_search 需要 query。无参数浮现请用 breath()。"
     return await _breath_impl(query=query, domain=domain, max_results=max_results,
