@@ -3657,11 +3657,12 @@ async def api_reclassify_uncategorized(request):
     if request.method == "GET" or _RECLASSIFY.get("running"):
         return JSONResponse(dict(_RECLASSIFY))
     from reclassify import reclassify_uncategorized
+    pause_s, limit = _pacing_params(request)
     _RECLASSIFY.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
 
     async def _run():
         try:
-            await reclassify_uncategorized(bucket_mgr, dehydrator, _RECLASSIFY)
+            await reclassify_uncategorized(bucket_mgr, dehydrator, _RECLASSIFY, pause_s=pause_s, limit=limit)
         except Exception as e:
             _RECLASSIFY["last_error"] = f"{type(e).__name__}: {e}"[:300]
             logger.error(f"reclassify crashed / 重新分类中断: {e}")
@@ -3734,6 +3735,19 @@ async def api_review_decide(request):
     return JSONResponse({"ok": bool(ok) or action == "undo", "id": bid, "action": action})
 
 
+def _pacing_params(request) -> tuple[float, int]:
+    """批量 AI 任务的节奏: ?pause=两次调用间隔秒数(默认 6.5, 免费档每分钟约 10 次), ?limit=这次最多处理几条(0=全部)。"""
+    try:
+        pause_s = max(0.0, min(60.0, float(request.query_params.get("pause", 6.5))))
+    except (TypeError, ValueError):
+        pause_s = 6.5
+    try:
+        limit = max(0, int(request.query_params.get("limit", 0)))
+    except (TypeError, ValueError):
+        limit = 0
+    return pause_s, limit
+
+
 # --- 足迹地图(本 fork 新增) ---
 _PLACES_BACKFILL: dict = {"running": False, "processed": 0, "total": 0, "found": 0, "with_places": 0,
                           "errors": 0, "last_error": "", "started_at": "", "finished_at": ""}
@@ -3757,11 +3771,12 @@ async def api_places_backfill(request):
     if request.method == "GET" or _PLACES_BACKFILL.get("running"):
         return JSONResponse(dict(_PLACES_BACKFILL))
     from places import backfill_places
+    pause_s, limit = _pacing_params(request)
     _PLACES_BACKFILL.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
 
     async def _run():
         try:
-            await backfill_places(bucket_mgr, dehydrator, _PLACES_BACKFILL)
+            await backfill_places(bucket_mgr, dehydrator, _PLACES_BACKFILL, pause_s=pause_s, limit=limit)
         except Exception as e:
             _PLACES_BACKFILL["last_error"] = f"{type(e).__name__}: {e}"[:300]
             logger.error(f"places backfill crashed / 地点回填中断: {e}")

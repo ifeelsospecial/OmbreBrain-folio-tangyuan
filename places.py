@@ -111,7 +111,8 @@ async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str) ->
     return len(places)
 
 
-async def backfill_places(bucket_mgr, dehydrator, progress: dict, pause_s: float = 0.3) -> dict:
+async def backfill_places(bucket_mgr, dehydrator, progress: dict, pause_s: float = 6.5, limit: int = 0) -> dict:
+    """pause_s: 每次 AI 调用间隔(免费档每分钟约 10 次); limit: 这次最多处理几条(0=全部), 留额度给日常聊天。"""
     progress.update({"running": True, "processed": 0, "total": 0, "found": 0, "with_places": 0,
                      "errors": 0, "last_error": ""})
     if not getattr(dehydrator, "api_available", False):
@@ -122,6 +123,8 @@ async def backfill_places(bucket_mgr, dehydrator, progress: dict, pause_s: float
         if "places" not in (b.get("metadata") or {})
         and should_extract(b.get("metadata") or {}, b.get("content", ""))
     ]
+    if limit and limit > 0:
+        buckets = buckets[:limit]
     progress["total"] = len(buckets)
     for b in buckets:
         try:

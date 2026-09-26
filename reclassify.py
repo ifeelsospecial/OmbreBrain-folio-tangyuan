@@ -24,7 +24,8 @@ def is_uncategorized(meta: dict) -> bool:
     return not domains or all(d in _UNCATEGORIZED for d in domains)
 
 
-async def reclassify_uncategorized(bucket_mgr, dehydrator, progress: dict, pause_s: float = 0.5) -> dict:
+async def reclassify_uncategorized(bucket_mgr, dehydrator, progress: dict, pause_s: float = 6.5, limit: int = 0) -> dict:
+    """pause_s: 每次 AI 调用间隔(免费档每分钟约 10 次; 0.5 秒会被 429 限流); limit: 这次最多处理几条(0=全部)。"""
     progress.update({"running": True, "processed": 0, "total": 0, "changed": 0, "skipped": 0,
                      "errors": 0, "last_error": ""})
     if not getattr(dehydrator, "api_available", False):
@@ -37,6 +38,8 @@ async def reclassify_uncategorized(bucket_mgr, dehydrator, progress: dict, pause
         and is_uncategorized(b.get("metadata") or {})
         and str(b.get("content") or "").strip()
     ]
+    if limit and limit > 0:
+        buckets = buckets[:limit]
     progress["total"] = len(buckets)
 
     for bucket in buckets:
