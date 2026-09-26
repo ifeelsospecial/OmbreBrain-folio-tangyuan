@@ -332,3 +332,60 @@ async def test_places_backfill_skips_already_checked(srv, monkeypatch):
     progress2 = {}
     await places_mod.backfill_places(bm, llm, progress2, pause_s=0)
     assert progress2["total"] == 0 and llm.calls == 1                 # 看过的不再看
+
+
+# ---- 知识本 ----
+
+@pytest.mark.asyncio
+async def test_knowledge_stays_out_of_surfacing_but_is_searchable(srv):
+    server, bm = srv
+    k = await bm.create(content="德国坐火车前要先在月台打卡验票", name="德国火车验票", tags=["handbook", "旅行"], domain=["出行"])
+    n = await bm.create(content="今天吃了拉面", name="拉面")
+    out = await server.breath()
+    assert n in out and k not in out
+    assert k in await server.breath_search(query="德国火车验票")
+    chan = await server.breath_advanced(domain="知识")
+    assert "=== 知识本 · 1 条 ===" in chan and "【出行】" in chan and "月台打卡" in chan
+    _age(bm, k, 40)
+    assert k not in [r["id"] for r in server._review_candidates(await bm.list_all())]
+
+
+@pytest.mark.asyncio
+async def test_notes_api_create_and_list(srv):
+    server, bm = srv
+
+    class _R:
+        def __init__(self, method, body=None):
+            self.method, self._b, self.query_params = method, body, {}
+
+        async def json(self):
+            return self._b
+    bad = await server.api_notes(_R("POST", {"title": "空"}))
+    assert bad.status_code == 400
+    resp = await server.api_notes(_R("POST", {"title": "焦虑三步", "content": "先呼吸，再命名感受，最后做一件小事", "topic": "身心"}))
+    note = json.loads(resp.body)["note"]
+    meta = (await bm.get(note["id"]))["metadata"]
+    assert meta["created_by"] == "user" and "handbook" in meta["tags"] and note["topic"] == "身心" and note["mine"]
+    listed = json.loads((await server.api_notes(_R("GET"))).body)
+    assert [n["title"] for n in listed["notes"]] == ["焦虑三步"] and listed["topics"] == [["身心", 1]]
+
+
+@pytest.mark.asyncio
+async def test_places_merge_city_into_tags(srv):
+    server, bm = srv
+    llm = _PlaceLLM()
+    bid = await bm.create(content="她在爱丁堡", tags=["旅行"], domain=["出行"])
+    await places_mod.attach_places(bm, llm, bid, "她在爱丁堡")
+    assert (await bm.get(bid))["metadata"]["tags"] == ["旅行", "爱丁堡"]
+
+
+@pytest.mark.asyncio
+async def test_decay_never_archives_knowledge(srv):
+    server, bm = srv
+    k = await bm.create(content="很久以前学的一招", tags=["handbook"], importance=1, arousal=0.0)
+    n = await bm.create(content="很久以前的小事", importance=1, arousal=0.0)
+    _age(bm, k, 400)
+    _age(bm, n, 400)
+    await server.decay_engine.run_decay_cycle()
+    assert (await bm.get(k))["metadata"].get("type") != "archived"
+    assert (await bm.get(n))["metadata"].get("type") == "archived"      # 对照: 普通记忆确实会被归档

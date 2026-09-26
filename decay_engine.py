@@ -22,7 +22,7 @@
 import math
 import asyncio
 import logging
-from utils import is_internalized, is_protected, is_highlighted, days_since_iso
+from utils import is_internalized, is_protected, is_highlighted, days_since_iso, is_knowledge
 
 logger = logging.getLogger("ombre_brain.decay")
 
@@ -247,6 +247,9 @@ class DecayEngine:
             # 跳过固化桶、feel 桶(心动时刻防遗忘)、保护桶(防衰减)。
             # highlight 单独不防衰减,仍参与衰减/归档,只是浮现时被推到核心准则区。
             if meta.get("type") in ("permanent", "feel", "plan", "letter", "i") or is_protected(meta):
+                continue
+            # 知识本条目(handbook)不淡掉: 学到的东西不会因为很久没提就不算数
+            if is_knowledge(meta):
                 continue
 
             checked += 1
