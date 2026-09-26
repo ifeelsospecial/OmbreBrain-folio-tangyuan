@@ -40,6 +40,9 @@ jobs:
               if echo "$body" | grep -q '"finished_at": *""'; then
                 echo "::error::重新分类没有在运行也没有完成记录（服务可能重启了），请重新运行本 workflow"; exit 1
               fi
+              if echo "$body" | grep -q '"stopped": *"[^"]'; then
+                echo "::error::额度用完，重新分类提前停下了（看上面最后一行的 stopped）。额度重置后再跑一次即可"; exit 1
+              fi
               echo "完成"; exit 0
             fi
           done

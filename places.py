@@ -84,15 +84,19 @@ async def extract_places(dehydrator, content: str) -> list[dict]:
     return normalize_places(data.get("places") if isinstance(data, dict) else data)
 
 
-async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str, merge: bool = False) -> int:
+async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str, merge: bool = False,
+                        raise_errors: bool = False) -> int:
     """认地点并写回; 返回认出的个数。任何异常只记日志。
-    merge=True: 新内容是合并进已有记忆的, 认出的地点并进原有 places(不覆盖旧的)。"""
+    merge=True: 新内容是合并进已有记忆的, 认出的地点并进原有 places(不覆盖旧的)。
+    raise_errors=True(批量回填用): AI 调用失败时抛出, 让回填如实计错、撞额度时能停下。"""
     if not getattr(dehydrator, "api_available", False):
         return 0
     try:
         places = await extract_places(dehydrator, content)
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"place extraction failed / 地点识别失败 {bucket_id}: {type(exc).__name__}: {exc}")
+        if raise_errors:
+            raise
         return 0
 
     def _fn(post, _p=places):
@@ -131,14 +135,21 @@ async def backfill_places(bucket_mgr, dehydrator, progress: dict, pause_s: float
     if limit and limit > 0:
         buckets = buckets[:limit]
     progress["total"] = len(buckets)
+    from utils import QuotaGuard
+    guard = QuotaGuard(progress)
     for b in buckets:
         try:
-            n = await attach_places(bucket_mgr, dehydrator, b["id"], b.get("content", ""))
+            n = await attach_places(bucket_mgr, dehydrator, b["id"], b.get("content", ""), raise_errors=True)
             progress["found"] += n
             progress["with_places"] += int(n > 0)
+            guard.ok()
         except Exception as exc:  # noqa: BLE001
             progress["errors"] += 1
             progress["last_error"] = f"{b['id']}: {exc}"[:300]
+            progress["processed"] += 1
+            if await guard.failed(exc):
+                break
+            continue
         progress["processed"] += 1
         if pause_s:
             await asyncio.sleep(pause_s)
