@@ -3,15 +3,22 @@ name: 给存量记忆认地点（足迹地图）
 # 手动触发: 调服务端 /api/places/backfill, 用当前 AI 配置给还没看过地点的存量记忆认一遍地点(只看出行领域/带去向字眼的)。
 # 用的是和每日备份相同的 Variable OMBRE_BACKUP_URL 与 Secret OMBRE_ADMIN_TOKEN。
 # 重复运行是安全的: 看过的记忆(哪怕没认出地点)不会再看。
-# 服务端在后台跑; 这里每 30 秒查一次进度, 最多等 60 分钟。Render 若中途重启, 再跑一次即可。
+# 服务端在后台跑; 这里每 30 秒查一次进度, 最多等 85 分钟。Render 若中途重启, 再跑一次即可。
 
 on:
   workflow_dispatch:
+    inputs:
+      pause:
+        description: "两次 AI 调用之间停几秒(免费档每分钟约 10 次; 太快会被 429 限流)"
+        default: "6.5"
+      limit:
+        description: "这次最多处理几条(0=全部)。留点额度给日常聊天"
+        default: "100"
 
 jobs:
   places:
     runs-on: ubuntu-latest
-    timeout-minutes: 70
+    timeout-minutes: 95
     steps:
       - name: Start and follow places backfill
         env:
@@ -23,9 +30,9 @@ jobs:
             echo "::error::需要 Variable OMBRE_BACKUP_URL 和 Secret OMBRE_ADMIN_TOKEN"; exit 1
           fi
           URL="${BASE_URL%/}/api/places/backfill"
-          START_URL="$URL"
+          START_URL="$URL?pause=${{ inputs.pause }}&limit=${{ inputs.limit }}"
           curl -sS --retry 3 --retry-delay 20 --max-time 90 -X POST -H "X-Admin-Token: $ADMIN_TOKEN" "$START_URL"; echo
-          for i in $(seq 120); do
+          for i in $(seq 170); do
             sleep 30
             body=$(curl -sS --retry 3 --retry-delay 10 --max-time 60 -H "X-Admin-Token: $ADMIN_TOKEN" "$URL" || echo '{}')
             echo "$body"
@@ -36,4 +43,4 @@ jobs:
               echo "完成"; exit 0
             fi
           done
-          echo "::error::60 分钟内没跑完"; exit 1
+          echo "::error::85 分钟内没跑完"; exit 1
