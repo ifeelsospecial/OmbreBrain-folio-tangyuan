@@ -723,6 +723,50 @@ def _emo_value(source: dict, key: str, default: float) -> float:
     return float(value) if isinstance(value, (int, float)) else default
 
 
+# 调用方(祁煜)自己给了领域 → 不再叫 AI 打标, 省免费额度(本 fork 新增)。
+# 可选领域与 dehydrator.ANALYZE_PROMPT 保持一致: 大类名和细类名都认。
+DOMAIN_CHOICES = {
+    "日常": ["饮食", "穿搭", "出行", "居家", "购物"],
+    "人际": ["家庭", "恋爱", "友谊", "社交"],
+    "成长": ["工作", "学习", "考试", "求职"],
+    "身心": ["健康", "心理", "睡眠", "运动"],
+    "兴趣": ["游戏", "影视", "音乐", "阅读", "创作", "手工"],
+    "数字": ["编程", "AI", "硬件", "网络"],
+    "事务": ["财务", "计划", "待办"],
+    "内心": ["情绪", "回忆", "梦境", "自省"],
+}
+_DOMAIN_SET = set(DOMAIN_CHOICES) | {d for subs in DOMAIN_CHOICES.values() for d in subs}
+
+
+def _split_list(value) -> list:
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if v is not None and str(v).strip()]
+    return [t.strip() for t in re.split(r"[,，、]", str(value or "")) if t.strip()]
+
+
+def _caller_analysis(content: str, domain="", tags=None, name: str = "", valence=-1, arousal=-1):
+    """调用方写明了合法领域时, 直接用它当打标结果(返回和 dehydrator.analyze 同样形状的 dict);
+    领域没给或都不认识 → 返回 None, 照旧叫 AI 打标。"""
+    domains = [d for d in _split_list(domain) if d in _DOMAIN_SET][:2]
+    if not domains:
+        return None
+
+    def _emo(v, default):
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1 else default
+
+    title = strip_wikilinks(str(name or "")).strip()[:20]
+    if not title:
+        title = re.sub(r"\s+", " ", strip_wikilinks(str(content or ""))).strip()[:12]
+    return {
+        "domain": domains,
+        "tags": _split_list(tags) if tags is not None else [],
+        "valence": _emo(valence, 0.5),
+        "arousal": _emo(arousal, 0.3),
+        "suggested_name": title,
+        "self_tagged": True,
+    }
+
+
 async def _analyze_with_fallback(content: str) -> dict:
     """自动打标失败时使用同一份中性默认值，保证正文仍然能落盘。"""
     try:
@@ -2005,9 +2049,12 @@ async def hold(
     meaning: str = "",
     test_data: bool = False,
     quotes: list | None = None,
+    domain: str = "",
+    name: str = "",
 ) -> str:
     """    她说了她的位置、她做的事、她的情绪、她遇到的人——先存再回话，不判断够不够格。
-存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。quotes=当时说出口、并且你当时就知道它重要的那几句原话,原样留下(["她说的原话", ...] 或 [{"text":..., "speaker":"她"}]),每条记忆最多3句、每句最多100字,超了整次拒绝不截断;只在 breath_search(quotes=True) 命中这条记忆时才会带出来。不是每条记忆都要有引语,想不起哪句特别重要就不传。"""
+存储单条记忆——对话里出现值得跨对话记住的事实/事件/约定就主动调用(别等用户开口要)。自动打标+合并。tags逗号分隔,importance 1-10。pinned=True创建永久钉选桶。feel=True存储你的第一人称感受(不参与普通浮现)。source_bucket=被你内化的记忆桶ID(feel模式下,标记源记忆为已内化,从此不再浮现)。event_time=事件实际发生时间(YYYY-MM-DD 或 ISO 时间戳),不传默认就是现在。level=记忆分级: 1=通用(默认), 2=私密(仅完整鉴权通道可见; 用户示意某事仅在私密空间保留时传 2)。当用户提到的事件不是发生在现在时(如"上周末""昨晚""三月那次"),应当传 event_time 而非默认。quotes=当时说出口、并且你当时就知道它重要的那几句原话,原样留下(["她说的原话", ...] 或 [{"text":..., "speaker":"她"}]),每条记忆最多3句、每句最多100字,超了整次拒绝不截断;只在 breath_search(quotes=True) 命中这条记忆时才会带出来。不是每条记忆都要有引语,想不起哪句特别重要就不传。
+【自己打标·省额度】尽量一起传 domain(1~2 个,逗号分隔)+tags(5~10 个关键词,含她可能用来搜的说法)+name(10 字内标题)+valence/arousal(0~1),这样就不用再请外部 AI 分析,更快也不占免费额度。domain 只能从这些里选:饮食/穿搭/出行/居家/购物, 家庭/恋爱/友谊/社交, 工作/学习/考试/求职, 健康/心理/睡眠/运动, 游戏/影视/音乐/阅读/创作/手工, 编程/AI/硬件/网络, 财务/计划/待办, 情绪/回忆/梦境/自省。不传 domain 就照旧自动分析。"""
     await decay_engine.ensure_started()
 
     # --- Input validation / 输入校验 ---
@@ -2076,8 +2123,9 @@ async def hold(
         return f"🫧feel→{bucket_id}"
 
     # --- Step 1: auto-tagging / 自动打标 ---
+    # 调用方自己写了领域就直接用(不调 AI); 否则照旧分析
     try:
-        analysis = await dehydrator.analyze(content)
+        analysis = _caller_analysis(content, domain, None, name, valence, arousal) or await dehydrator.analyze(content)
     except Exception as e:
         logger.warning(f"Auto-tagging failed, using defaults / 自动打标失败: {e}")
         analysis = {
@@ -2154,7 +2202,7 @@ async def hold(
 # =============================================================
 @mcp.tool()
 async def grow(content: str = "", event_time: str = "", items: list | None = None) -> str:
-    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance,quotes}],逐字入库并跳过二次拆分/改写；传 items 时忽略 content。quotes 同 hold(每条最多3句、每句100字,任一条超限整次拒绝);只有 items 方式能带引语,content 方式是系统替你拆的,不带。"""
+    """日记归档,自动拆分为多桶。短内容(<30字)走快速路径。event_time=事件发生时间。若上层已拆好最终正文,可传 items=[字符串或 {content,importance,quotes,domain,tags,name,valence,arousal}],逐字入库并跳过二次拆分/改写(每条带上 domain 等就不再逐条请外部 AI 打标,规则同 hold)；传 items 时忽略 content。quotes 同 hold(每条最多3句、每句100字,任一条超限整次拒绝);只有 items 方式能带引语,content 方式是系统替你拆的,不带。"""
     return await _grow_impl(content=content, event_time=event_time, items=items)
 
 
@@ -2178,6 +2226,7 @@ async def _grow_impl(content: str = "", event_time: str = "", items: list | None
             return f"grow items 正文总量过大（{total_item_bytes / 1024:.1f} KB > 上限 {total_cap / 1024:.0f} KB），请分批调用。"
         clean = []
         item_quotes = {}
+        item_presets = {}  # 条目自带 domain/tags/name/valence/arousal → 不再逐条叫 AI 打标
         from quote_store import normalize_quotes
         for idx, item in enumerate(items):
             item_importance = None
@@ -2188,6 +2237,10 @@ async def _grow_impl(content: str = "", event_time: str = "", items: list | None
                 raw_importance = item.get("importance")
                 if isinstance(raw_importance, int) and 1 <= raw_importance <= 10:
                     item_importance = raw_importance
+                preset = _caller_analysis(item_content, item.get("domain", ""), item.get("tags"), item.get("name", ""),
+                                          item.get("valence", -1), item.get("arousal", -1))
+                if preset:
+                    item_presets[len(clean)] = preset
                 if item.get("quotes") not in (None, "", []):
                     try:
                         item_quotes[len(clean)] = normalize_quotes(item.get("quotes"))
@@ -2209,7 +2262,7 @@ async def _grow_impl(content: str = "", event_time: str = "", items: list | None
         grow_notes: list = []
         for item_pos, (item_content, item_importance) in enumerate(clean):
             try:
-                analysis = await _analyze_with_fallback(item_content)
+                analysis = item_presets.get(item_pos) or await _analyze_with_fallback(item_content)
                 result_name, is_merged = await _merge_or_create(
                     raw_source=raw_source,
                     content=item_content,
