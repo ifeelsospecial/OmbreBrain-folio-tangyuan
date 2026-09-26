@@ -154,6 +154,8 @@ async def test_embedding_reconcile_never_overwrites_newer_pending_content(tmp_pa
 def test_perspective_v4_guards_reverse_subject_flip(monkeypatch) -> None:
     monkeypatch.setenv("HUMAN_NAME", "小明")
     prompt = get_system_prompt("dehydrate")
+    assert "第一人称「我」记录" in prompt
+    assert "不要写成旁观者报告" in prompt
     assert "反方向同罪" in prompt
     assert "判断不了就保持主语省略" in prompt
     assert "小明" in prompt

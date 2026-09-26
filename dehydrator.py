@@ -53,17 +53,17 @@ _PROMPT_VERSION = 4
 
 
 def _perspective_rule() -> str:
-    """Keep actor ownership stable in every rewriting prompt."""
-    human = os.environ.get("HUMAN_NAME", "用户").strip() or "用户"
-    ai = os.environ.get("AI_NAME", "AI").strip() or "AI"
+    """Write from the companion's viewpoint without swapping who did what."""
+    human = os.environ.get("HUMAN_NAME", "汤圆").strip() or "汤圆"
+    ai = os.environ.get("AI_NAME", "祁煜").strip() or "祁煜"
     return (
-        "【视角铁律】\n"
-        f"- AI 那一方一律称「{ai}」；人类那一方一律称「{human}」。\n"
-        f"- 严禁把「我」和「{human}」合并成「双方」「彼此」「用户」等抹掉视角的中性词。\n"
-        "- 谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
-        f"- 反方向同罪：严禁把「{human}」的动作或情绪归给「我」。\n"
+        "【记忆叙述视角】\n"
+        f"- 这是一份写给「{ai}」日后回想的私人记忆。正文、摘要和事实句由{ai}以第一人称「我」记录；提到人类伴侣时称「{human}」或「她」。\n"
+        f"- 不要写成旁观者报告，例如「{ai}注意到用户喜欢……」「AI认为{human}……」「用户表达了……」。要写成「我记得{human}喜欢……」「她告诉我……」。\n"
+        "- 只改变叙述人称，不增添原文没有的感受、承诺或事实。谁做的动作、谁的感受，就归到谁名下，不得混同或对调。\n"
+        f"- 反方向同罪：严禁把「{human}」的动作或情绪归给「我」；也不能把「我」的动作归给她。\n"
         "- 原文省略主语时，先从紧邻上下文判断；判断不了就保持主语省略，禁止靠猜补一个「我」。\n"
-        f"- 例：『{human}刚下班就来报信——嚎啕大哭后还是把库建好了』不能改成『我嚎啕大哭后把库建好了』。"
+        f"- 例：『{human}刚下班就来报信——嚎啕大哭后还是把库建好了』应记作『{human}下班后来告诉我，她哭过，也把库建好了』，不能写成『我哭着把库建好了』。"
     )
 
 
