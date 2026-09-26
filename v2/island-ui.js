@@ -23,7 +23,7 @@
   }
 
   function topbar(active) {
-    const tabs = [['map', '/v2/map/', '足迹'], ['notes', '/v2/notes/', '知识本'], ['review', '/v2/review/', '回顾']];
+    const tabs = [['about', '/v2/about/', '关于你'], ['map', '/v2/map/', '足迹'], ['notes', '/v2/notes/', '知识本'], ['review', '/v2/review/', '回顾']];
     const back = island
       ? `<a class="pg-back" href="${ISLAND_URL}">← 回小岛</a>`
       : `<a class="pg-back" href="/v2/cells/">← 记忆库</a>`;
