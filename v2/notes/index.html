@@ -43,12 +43,6 @@
   .fab { position: fixed; right: calc(20px + env(safe-area-inset-right)); bottom: calc(22px + env(safe-area-inset-bottom)); z-index: 20;
     border-radius: 999px; padding: 0 22px; min-height: 52px; box-shadow: 0 10px 30px color-mix(in srgb, var(--pg-accent) 35%, transparent); }
 
-  .reader-topic { font: 600 11px var(--sans); letter-spacing: .16em; color: var(--c); margin: 6px 0 10px; }
-  .reader h2 { font: 600 24px/1.4 var(--serif-cn); margin: 0 0 16px; }
-  .reader .text { font-size: 16.5px; line-height: 1.95; white-space: pre-line; word-break: break-word; }
-  .reader .meta { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--pg-line); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font: 13px var(--sans); color: var(--pg-soft); }
-  .reader .meta a { color: var(--pg-accent); text-decoration: none; }
-
   .form label { display: block; font: 600 12px var(--sans); letter-spacing: .1em; color: var(--pg-soft); margin: 16px 0 7px; }
   .form textarea { min-height: 150px; resize: vertical; }
   .form .row { display: flex; gap: 7px; flex-wrap: wrap; }
@@ -78,9 +72,6 @@
 </main>
 <button class="btn primary fab" id="add">＋ 记一条</button>
 
-<div class="sheet-wrap" id="reader-wrap" aria-hidden="true">
-  <div class="sheet reader" role="dialog" aria-modal="true" aria-label="知识条目" id="reader"></div>
-</div>
 <div class="sheet-wrap" id="form-wrap" aria-hidden="true">
   <form class="sheet form" id="form" role="dialog" aria-modal="true" aria-label="记一条知识">
     <div class="sheet-grip"></div>
@@ -142,8 +133,8 @@
           ${n.mine ? '<span class="mine">by you</span>' : ''}</div>
       </article>`).join('');
     grid.querySelectorAll('.note').forEach(el => {
-      el.onclick = () => openReader(el.dataset.id);
-      el.onkeydown = e => { if (e.key === 'Enter') openReader(el.dataset.id); };
+      el.onclick = () => openNote(el.dataset.id);
+      el.onkeydown = e => { if (e.key === 'Enter') openNote(el.dataset.id); };
     });
   }
 
@@ -152,22 +143,10 @@
     w.classList.toggle('open', open);
     w.setAttribute('aria-hidden', String(!open));
   }
-  ['reader-wrap', 'form-wrap'].forEach(id => document.getElementById(id).addEventListener('click', e => { if (e.target.id === id) sheet(id, false); }));
-  document.addEventListener('keydown', e => { if (e.key === 'Escape') { sheet('reader-wrap', false); sheet('form-wrap', false); } });
+  document.getElementById('form-wrap').addEventListener('click', e => { if (e.target.id === 'form-wrap') sheet('form-wrap', false); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') sheet('form-wrap', false); });
 
-  function openReader(id) {
-    const n = notes.find(x => x.id === id);
-    if (!n) return;
-    const r = document.getElementById('reader');
-    r.style.setProperty('--c', hue(n.topic));
-    r.innerHTML = `<div class="sheet-grip"></div><div class="reader-topic">${esc(n.topic)}</div>
-      <h2>${esc(n.title)}</h2><div class="text">${esc(n.content)}</div>
-      <div class="meta"><span>${esc(n.day)}</span>
-        ${n.cities.map(c => `<a href="/v2/map/?city=${encodeURIComponent(c)}">📍 ${esc(c)}</a>`).join('')}
-        ${n.tags.filter(t => !n.cities.includes(t) && t !== n.topic).map(t => `<span class="chip" style="cursor:default">${esc(t)}</span>`).join('')}
-        ${n.mine ? '<span style="margin-left:auto;font:italic 15px var(--serif-en)">by you</span>' : '<span style="margin-left:auto;font:italic 15px var(--serif-en)">from him</span>'}</div>`;
-    sheet('reader-wrap', true);
-  }
+  function openNote(id) { location.href = 'note.html?id=' + encodeURIComponent(id); }
 
   let pickedTopic = '';
   function renderFormTopics() {

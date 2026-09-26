@@ -1149,6 +1149,148 @@ def _note_row(b: dict) -> dict:
     }
 
 
+# --- 知识本详情页 ---
+_NOTE_HIDDEN_TAGS = {"handbook", "知识", "讲解"}
+_JOURNEY_TAG_RE = re.compile(r"^[a-z]+[-_]?\d{4}$", re.I)   # italy2026 这类旅程标签
+_NOTE_URL_RE = re.compile(r"https?://[^\s，。、；）)\]】>\"'<]+")
+_HER_NOTE_PREFIX_RE = re.compile(r"^她的笔记\s*[:：]\s*")
+# 「类别:名字」标签 → 相关页卡片上的"为什么相关"
+_NOTE_KIND_REASON = {
+    "城市": "同一座城市", "国家": "同一个国家", "地区": "同一个地区", "地点": "同一个地方", "景点": "同一个地方",
+    "画家": "同一位画家", "艺术家": "同一位艺术家", "雕塑家": "同一位雕塑家", "建筑师": "同一位建筑师",
+    "作者": "同一位作者", "作家": "同一位作家", "人物": "同一个人", "时期": "同一个时期", "时代": "同一个时代",
+    "世纪": "同一个世纪", "流派": "同一个流派", "风格": "同一种风格", "博物馆": "同一座博物馆",
+    "美术馆": "同一座美术馆", "教堂": "同一座教堂", "主题": "同一个主题", "作品": "同一件作品",
+}
+
+
+_NOTE_REL_REASON = {"related_to": "记忆里连着", "same_event": "同一件事", "caused_by": "前因后果",
+                    "causes": "前因后果", "continuation_of": "前后接着", "continues": "前后接着"}
+
+
+def _split_note_tag(tag: str):
+    """「城市:罗马」/「城市：罗马」→ ("城市", "罗马"); 普通标签 → None。"""
+    m = re.match(r"^\s*([^:：]{1,12})\s*[:：]\s*(.+?)\s*$", str(tag or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _note_tag_visible(tag: str) -> bool:
+    t = str(tag or "").strip()
+    return bool(t) and not t.startswith("__") and t.lower() not in _NOTE_HIDDEN_TAGS and not _JOURNEY_TAG_RE.match(t)
+
+
+def _note_kind_tags(meta: dict) -> set:
+    return {kt for t in (meta.get("tags") or []) if _note_tag_visible(t) and (kt := _split_note_tag(t))}
+
+
+def _parse_note_body(content: str) -> dict:
+    """把知识条目正文拆成 关于 / 叩问(问答) / 来源, 叩问和来源不再留在「关于」里。"""
+    lines = str(content or "").replace("\r\n", "\n").split("\n")
+    source = None
+    for i in range(len(lines) - 1, -1, -1):   # 正文最后一行以"来源："开头的
+        if not lines[i].strip():
+            continue
+        if re.match(r"^\s*来源\s*[:：]", lines[i]):
+            text = re.sub(r"^\s*来源\s*[:：]\s*", "", lines[i])
+            source = {"text": text, "urls": _NOTE_URL_RE.findall(text)}
+            lines = lines[:i]
+        break
+    qa, about = [], lines
+    head = next((i for i, l in enumerate(lines) if re.sub(r"[#【】\[\]*\s:：]", "", l) == "叩问"), None)
+    if head is not None:
+        about, rest = lines[:head], []
+        cur = None
+        for l in lines[head + 1:]:
+            m = re.match(r"^\s*(问|答)\s*[:：]\s*(.*)$", l)
+            if m and m.group(1) == "问":
+                cur = {"q": m.group(2).strip(), "a": ""}
+                qa.append(cur)
+            elif m and cur is not None:
+                cur["a"] = (cur["a"] + "\n" + m.group(2)).strip()
+            elif cur is not None and l.strip():   # 多行回答/问题的续行
+                key = "a" if cur["a"] else "q"
+                cur[key] = (cur[key] + "\n" + l.strip()).strip()
+            else:
+                rest.append(l)
+        about = about + rest   # 叩问下面不是问答格式的零散文字, 留回「关于」
+    return {"about": "\n".join(about).strip(), "qa": qa, "source": source}
+
+
+def _note_related(bucket: dict, knowledge: list) -> list:
+    """「翻到相关的页」: 记忆关系里也是知识的(双向) + 共享任意「类别:名字」标签的知识条目, 合并去重。"""
+    meta = bucket.get("metadata") or {}
+    me, mine = bucket["id"], _note_kind_tags(meta)
+    by_id = {b["id"]: b for b in knowledge}
+    found: dict = {}
+
+    def add(bid, reason, rank):
+        if bid == me or bid not in by_id:
+            return
+        row = found.setdefault(bid, {"reasons": [], "rank": 0})
+        if reason not in row["reasons"]:
+            row["reasons"].append(reason)
+        row["rank"] += rank
+
+    def why(rel):   # 方向无关的说法, 反向那头读起来也通
+        if rel["type"] == "custom":
+            return rel["label"] or "记忆里连着"
+        return _NOTE_REL_REASON.get(rel["type"], "记忆里连着")
+
+    for rel in _relations_for_api(meta):
+        add(rel["target"], why(rel), 3)
+    for b in knowledge:
+        for rel in _relations_for_api(b.get("metadata") or {}):
+            if rel["target"] == me:
+                add(b["id"], why(rel), 3)
+        for kind, name in sorted(mine & _note_kind_tags(b.get("metadata") or {})):
+            add(b["id"], f"{_NOTE_KIND_REASON.get(kind, '同一个' + kind)} · {name}", 1)
+    out = []
+    for bid, row in found.items():
+        n = _note_row(by_id[bid])
+        out.append({"id": bid, "title": n["title"], "topic": n["topic"], "day": n["day"],
+                    "snippet": _parse_note_body(n["content"])["about"][:80], "reasons": row["reasons"],
+                    "_rank": row["rank"]})
+    out.sort(key=lambda r: r["day"], reverse=True)
+    out.sort(key=lambda r: -r["_rank"])   # 关系越多越靠前, 同分新的在前
+    for r in out:
+        r.pop("_rank")
+    return out[:12]
+
+
+def _note_detail(bucket: dict, knowledge: list) -> dict:
+    meta = bucket.get("metadata") or {}
+    row = _note_row(bucket)
+    kinds, plain = [], []
+    for t in meta.get("tags") or []:
+        if not _note_tag_visible(t):
+            continue
+        kt = _split_note_tag(t)
+        if kt:
+            kinds.append({"kind": kt[0], "name": kt[1]})
+        elif str(t) not in row["cities"] and str(t) != row["topic"]:
+            plain.append(str(t))
+    cities = list(dict.fromkeys(row["cities"] + [k["name"] for k in kinds if k["kind"] == "城市"]))
+    his, hers = [], []
+    for m in meta.get("meaning") or []:
+        text = str(m or "").strip()
+        if not text:
+            continue
+        if _HER_NOTE_PREFIX_RE.match(text):
+            hers.append({"text": _HER_NOTE_PREFIX_RE.sub("", text), "at": "", "from_meaning": True})
+        else:
+            his.append(text)
+    for n in meta.get("her_notes") or []:
+        if isinstance(n, dict) and str(n.get("text") or "").strip():
+            hers.append({"text": str(n["text"]), "at": str(n.get("at") or "")})
+    return {
+        "id": row["id"], "title": row["title"], "topic": row["topic"], "day": row["day"],
+        "cities": cities, "kind_tags": kinds, "tags": plain, "mine": row["mine"],
+        **_parse_note_body(row["content"]),
+        "his_notes": his, "her_notes": hers,
+        "related": _note_related(bucket, knowledge),
+    }
+
+
 def _relations_for_api(meta: dict) -> list:
     """把 relation_links 精简成前端用的 [{target, type, label}]; 数据写坏就返回空, 不让列表接口失败。"""
     try:
@@ -3930,6 +4072,50 @@ async def api_notes(request):
     _schedule_place_extraction(bucket_id, content, [topic or "知识"])
     _invalidate_buckets_cache()
     return JSONResponse({"ok": True, "note": _note_row(await bucket_mgr.get(bucket_id))})
+
+
+def _is_live_knowledge(b: dict | None) -> bool:
+    meta = (b or {}).get("metadata") or {}
+    return bool(b) and is_knowledge(meta) and meta.get("type") != "trashed"
+
+
+@mcp.custom_route("/api/notes/{note_id}", methods=["GET"])
+async def api_note_detail(request):
+    """知识本详情页: 拆好的 关于/叩问/来源、两个人的笔记、相关的页。"""
+    from starlette.responses import JSONResponse
+    bucket = await bucket_mgr.get(request.path_params["note_id"])
+    if not _is_live_knowledge(bucket):
+        return JSONResponse({"ok": False, "error": "这一页找不到了"}, status_code=404)
+    knowledge = [b for b in await bucket_mgr.list_all(include_archive=False) if _is_live_knowledge(b)]
+    return JSONResponse({"ok": True, "note": _note_detail(bucket, knowledge)})
+
+
+@mcp.custom_route("/api/notes/{note_id}/her-note", methods=["POST"])
+async def api_note_her_note(request):
+    """POST {text} —— 她在详情页夹进一条笔记, 追加到元数据 her_notes [{text, at}]。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    note_id = request.path_params["note_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "笔记还空着"}, status_code=400)
+    if len(text) > 2000:
+        return JSONResponse({"ok": False, "error": "一条笔记最多 2000 字"}, status_code=400)
+    if not _is_live_knowledge(await bucket_mgr.get(note_id)):
+        return JSONResponse({"ok": False, "error": "这一页找不到了"}, status_code=404)
+    at = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+    try:
+        await bucket_mgr.update(note_id, her_notes_append={"text": text, "at": at})
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    _invalidate_buckets_cache()
+    meta = (await bucket_mgr.get(note_id))["metadata"]
+    return JSONResponse({"ok": True, "note": {"text": text, "at": at},
+                         "count": len(meta.get("her_notes") or [])})
 
 
 # --- 「关于你」档案(本 fork 新增) ---

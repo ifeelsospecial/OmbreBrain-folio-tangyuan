@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.compiled.js"></script>
+<script src="../island-ui.js"></script>
+<title>知识本</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
+<link rel="stylesheet" href="../island-ui.css" />
+<style>
+  .page { max-width: 720px; margin: 0 auto; }
+  .crumb { font: 13px var(--sans); color: var(--pg-soft); text-decoration: none; display: inline-flex; gap: 6px; margin-bottom: 18px; }
+  .crumb:hover { color: var(--pg-accent); }
+  .rise { animation: rise .45s both cubic-bezier(.2,.8,.2,1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+
+  /* 1. 照片区(占位) */
+  .photo { position: relative; aspect-ratio: 16 / 9; border-radius: var(--pg-radius); overflow: hidden; margin-bottom: 26px;
+    border: 1px solid var(--pg-line); box-shadow: var(--pg-shadow);
+    background:
+      radial-gradient(120% 90% at 15% 10%, color-mix(in srgb, var(--c) 30%, transparent), transparent 60%),
+      radial-gradient(90% 80% at 90% 100%, color-mix(in srgb, var(--pg-warm) 26%, transparent), transparent 60%),
+      var(--pg-paper);
+    display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 8px; color: var(--pg-soft); }
+  .photo svg { width: 46px; height: 46px; color: var(--c); opacity: .7; }
+  .photo span { font: italic 17px var(--serif-en); }
+
+  /* 2. 标题区 */
+  .topic { font: 600 11px var(--sans); letter-spacing: .18em; color: var(--c); margin-bottom: 10px; }
+  h1.title { font: 600 28px/1.35 var(--serif-cn); margin: 0 0 12px; letter-spacing: .01em; }
+  .meta { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; font: 13px var(--sans); color: var(--pg-soft); }
+  .meta .day { font: italic 500 16px var(--serif-en); color: var(--pg-ink); }
+  .meta a { color: var(--pg-accent); text-decoration: none; }
+  .tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+  .ktag { font: 12.5px/1 var(--sans); display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px 6px 6px; border-radius: 999px;
+    background: color-mix(in srgb, var(--pg-accent) 8%, var(--pg-paper)); border: 1px solid color-mix(in srgb, var(--pg-accent) 16%, var(--pg-line)); color: var(--pg-ink); }
+  .ktag b { font-weight: 600; font-size: 11px; letter-spacing: .06em; padding: 3px 7px; border-radius: 999px; background: var(--pg-accent); color: var(--pg-paper); }
+  .ptag { font: 12.5px/1 var(--sans); padding: 6px 11px; border-radius: 999px; border: 1px solid var(--pg-line); color: var(--pg-soft); }
+
+  /* 分节 */
+  section.block { margin-top: 38px; }
+  .h { display: flex; align-items: baseline; gap: 10px; margin: 0 0 14px; }
+  .h h2 { font: 600 19px var(--serif-cn); margin: 0; }
+  .h .en { font: italic 16px var(--serif-en); color: var(--pg-faint); }
+  .h::after { content: ""; flex: 1; height: 1px; background: var(--pg-line); transform: translateY(-5px); }
+
+  /* 3. 关于 */
+  .about { font-size: 16.5px; line-height: 1.95; white-space: pre-line; word-break: break-word; }
+
+  /* 4. 叩问 */
+  .qa { display: flex; flex-direction: column; gap: 18px; }
+  .q { align-self: flex-end; max-width: 82%; padding: 11px 16px; border-radius: 18px 18px 4px 18px; white-space: pre-line;
+    background: var(--pg-accent); color: var(--pg-paper); font-size: 15.5px; line-height: 1.7; box-shadow: var(--pg-shadow); }
+  .a { max-width: 92%; padding: 2px 0 0 14px; border-left: 2px solid color-mix(in srgb, var(--c) 55%, transparent);
+    font-size: 15.5px; line-height: 1.9; white-space: pre-line; margin-top: -6px; }
+
+  /* 5. 祁煜的笔记 */
+  .his { padding: 20px 22px; border-radius: var(--pg-radius); position: relative;
+    background: color-mix(in srgb, var(--pg-warm) 16%, var(--pg-paper)); border: 1px solid color-mix(in srgb, var(--pg-warm) 26%, transparent); }
+  .his p { margin: 0; font-size: 15.5px; line-height: 1.9; white-space: pre-line; }
+  .his p + p { margin-top: 12px; padding-top: 12px; border-top: 1px dashed color-mix(in srgb, var(--pg-warm) 40%, transparent); }
+  .his .sig { text-align: right; font: italic 16px var(--serif-en); color: color-mix(in srgb, var(--pg-warm) 80%, var(--pg-ink)); margin-top: 12px; }
+
+  /* 6. 你的笔记 */
+  .hers { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+  .her { padding: 14px 16px; border-radius: 14px; background: var(--pg-paper); border: 1px solid var(--pg-line); position: relative; }
+  .her p { margin: 0; white-space: pre-line; line-height: 1.85; }
+  .her time { display: block; margin-top: 6px; font: 12px var(--sans); color: var(--pg-faint); }
+  .her.new { animation: rise .4s both; }
+  .compose textarea { min-height: 96px; resize: vertical; }
+  .compose .row { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 10px; }
+  .compose .err { color: #c0605a; font: 13px var(--sans); }
+  .none { font: italic 16px var(--serif-en); color: var(--pg-faint); margin: 0 0 12px; }
+
+  /* 7. 相关的页 */
+  .rel { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 12px; }
+  .rcard { display: block; padding: 15px 16px 13px; text-decoration: none; color: inherit; position: relative; overflow: hidden;
+    transition: transform .25s cubic-bezier(.2,.8,.2,1), box-shadow .25s; }
+  .rcard:hover { transform: translateY(-3px); }
+  .rcard::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--rc); opacity: .75; }
+  .rcard h3 { font: 600 15.5px/1.45 var(--serif-cn); margin: 0 0 6px; }
+  .rcard p { margin: 0; font-size: 13.5px; line-height: 1.7; color: var(--pg-soft);
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .why { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+  .why span { font: 11.5px/1 var(--sans); padding: 4px 8px; border-radius: 999px; color: var(--pg-accent);
+    background: color-mix(in srgb, var(--pg-accent) 9%, transparent); }
+
+  /* 8. 来源 */
+  .src { font: 14px/1.8 var(--sans); color: var(--pg-soft); word-break: break-all; }
+  .src a { color: var(--pg-accent); text-decoration: underline; text-decoration-color: color-mix(in srgb, var(--pg-accent) 35%, transparent); text-underline-offset: 3px; }
+
+  @media (max-width: 560px) { h1.title { font-size: 24px; } .q { max-width: 92%; } .photo { aspect-ratio: 4 / 3; } }
+</style>
+</head>
+<body>
+<main class="pg">
+  <div id="top"></div>
+  <article class="page" id="page" aria-live="polite"><div class="empty">正在翻开……</div></article>
+</main>
+
+<script>
+(function () {
+  const { esc, api, toast, hue, fmtDay } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('notes');
+  const page = document.getElementById('page');
+  const id = new URLSearchParams(location.search).get('id') || '';
+  const URL_RE = /https?:\/\/[^\s，。、；）)\]】>"'<]+/g;
+
+  const linkify = text => {
+    let out = '', last = 0;
+    String(text).replace(URL_RE, (m, i) => {
+      out += esc(text.slice(last, i)) + `<a href="${esc(m)}" target="_blank" rel="noopener noreferrer">${esc(m)}</a>`;
+      last = i + m.length;
+    });
+    return out + esc(text.slice(last));
+  };
+  const day = iso => { const d = fmtDay(iso); return d.y ? `${d.d} ${d.m} ${d.y}` : ''; };
+  const stamp = at => at ? day(at.slice(0, 10)) : '';
+  const head = (zh, en) => `<div class="h"><h2>${zh}</h2><span class="en">${en}</span></div>`;
+
+  function herCard(n, fresh) {
+    return `<div class="her${fresh ? ' new' : ''}"><p>${esc(n.text)}</p>${n.at ? `<time>${esc(stamp(n.at))}</time>` : ''}</div>`;
+  }
+
+  function render(n) {
+    document.title = n.title + ' · 知识本';
+    page.style.setProperty('--c', hue(n.topic));
+    const cityLinks = n.cities.map(c => `<a href="/v2/map/?city=${encodeURIComponent(c)}">📍 ${esc(c)}</a>`).join('');
+    const tags = n.kind_tags.map(t => `<span class="ktag"><b>${esc(t.kind)}</b>${esc(t.name)}</span>`).join('')
+      + n.tags.map(t => `<span class="ptag">${esc(t)}</span>`).join('');
+    page.innerHTML = `
+      <a class="crumb" href="./">← 回到知识本</a>
+      <div class="photo rise" aria-label="照片（下一期）">
+        <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="10" width="36" height="28" rx="4"/><circle cx="17" cy="20" r="3.5"/><path d="M6 33l10-9 8 7 6-5 12 10"/></svg>
+        <span>a picture will live here</span>
+      </div>
+      <header class="rise" style="animation-delay:60ms">
+        <div class="topic">${esc(n.topic)}</div>
+        <h1 class="title">${esc(n.title)}</h1>
+        <div class="meta">${n.day ? `<span class="day">${esc(day(n.day))}</span>` : ''}${cityLinks}</div>
+        ${tags ? `<div class="tags">${tags}</div>` : ''}
+      </header>
+      ${n.about ? `<section class="block rise" style="animation-delay:120ms">${head('关于', 'About')}<div class="about">${esc(n.about)}</div></section>` : ''}
+      ${n.qa.length ? `<section class="block">${head('叩问', 'Questions')}<div class="qa">${n.qa.map(x =>
+          `<div class="q">${esc(x.q)}</div>${x.a ? `<div class="a">${esc(x.a)}</div>` : ''}`).join('')}</div></section>` : ''}
+      ${n.his_notes.length ? `<section class="block">${head('祁煜的笔记', 'His notes')}<div class="his">${n.his_notes.map(t =>
+          `<p>${esc(t)}</p>`).join('')}<div class="sig">— Qi Yu</div></div></section>` : ''}
+      <section class="block">${head('你的笔记', 'Your notes')}
+        <div class="hers" id="hers">${n.her_notes.length ? n.her_notes.map(x => herCard(x)).join('') : '<p class="none" id="none">still blank — leave a line?</p>'}</div>
+        <form class="compose" id="compose">
+          <textarea class="field" id="txt" maxlength="2000" placeholder="看到这一页想到的……" aria-label="你的笔记"></textarea>
+          <div class="row"><span class="err" id="err"></span><button class="btn primary" id="send" type="submit">夹进这一页</button></div>
+        </form>
+      </section>
+      ${n.related.length ? `<section class="block">${head('翻到相关的页', 'See also')}<div class="rel">${n.related.map(r => `
+          <a class="rcard paper" href="?id=${encodeURIComponent(r.id)}" style="--rc:${hue(r.topic)}">
+            <h3>${esc(r.title)}</h3>${r.snippet ? `<p>${esc(r.snippet)}</p>` : ''}
+            <div class="why">${r.reasons.map(w => `<span>${esc(w)}</span>`).join('')}</div></a>`).join('')}</div></section>` : ''}
+      ${n.source && n.source.text ? `<section class="block">${head('来源', 'Source')}<div class="src">${linkify(n.source.text)}</div></section>` : ''}`;
+    bindCompose();
+  }
+
+  function bindCompose() {
+    const form = document.getElementById('compose'), txt = document.getElementById('txt'),
+          btn = document.getElementById('send'), err = document.getElementById('err');
+    form.onsubmit = async e => {
+      e.preventDefault();
+      const text = txt.value.trim();
+      if (!text) { err.textContent = '还没写呢。'; txt.focus(); return; }
+      btn.disabled = true; err.textContent = '';
+      try {
+        const res = await api(`/api/notes/${encodeURIComponent(id)}/her-note`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+        const none = document.getElementById('none');
+        if (none) none.remove();
+        document.getElementById('hers').insertAdjacentHTML('beforeend', herCard(res.note, true));
+        txt.value = '';
+        toast('夹好了');
+      } catch (e2) {
+        err.textContent = '没夹上：' + e2.message;
+      } finally { btn.disabled = false; }
+    };
+    txt.onkeydown = e => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) form.requestSubmit(); };
+  }
+
+  (async function load() {
+    if (!id) { page.innerHTML = '<div class="empty"><div class="big">没有指定哪一页</div><div><a href="./">回到知识本</a></div></div>'; return; }
+    try {
+      render((await api(`/api/notes/${encodeURIComponent(id)}`)).note);
+      window.scrollTo(0, 0);
+    } catch (e) {
+      page.innerHTML = `<div class="empty"><div class="big">没能翻开这一页</div><div>${esc(e.message)} · <a href="./">回到知识本</a></div></div>`;
+    }
+  })();
+})();
+</script>
+</body>
+</html>
