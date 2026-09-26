@@ -3702,8 +3702,8 @@ async def api_review_decide(request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     bid = str((body or {}).get("id") or "").strip()
     action = str((body or {}).get("action") or "").strip().lower()
-    if action not in ("resolve", "keep") or not bid:
-        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep)"}, status_code=400)
+    if action not in ("resolve", "keep", "undo") or not bid:
+        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep/undo)"}, status_code=400)
     if not await bucket_mgr.get(bid):
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     if action == "resolve":
@@ -3711,6 +3711,18 @@ async def api_review_decide(request):
             post["resolved"] = True
             post["resolved_by"] = "weekly-review"
             return True
+    elif action == "undo":
+        # 撤销刚才在回顾页做的决定: 只撤回顾页自己写下的标记, 不碰别处设的 resolved
+        def _fn(post):
+            changed = False
+            if post.get("resolved_by") == "weekly-review":
+                post["resolved"] = False
+                del post.metadata["resolved_by"]
+                changed = True
+            if "review_keep_until" in post.metadata:
+                del post.metadata["review_keep_until"]
+                changed = True
+            return changed
     else:
         until = (_dt.utcnow().date() + _td(days=_REVIEW_KEEP_DAYS)).isoformat()
 
@@ -3719,7 +3731,7 @@ async def api_review_decide(request):
             return True
     ok = await bucket_mgr.rewrite_bucket_metadata(bid, _fn)
     _invalidate_buckets_cache()
-    return JSONResponse({"ok": bool(ok), "id": bid, "action": action})
+    return JSONResponse({"ok": bool(ok) or action == "undo", "id": bid, "action": action})
 
 
 # --- 足迹地图(本 fork 新增) ---
