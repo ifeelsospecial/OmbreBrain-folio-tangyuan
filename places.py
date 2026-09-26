@@ -84,8 +84,9 @@ async def extract_places(dehydrator, content: str) -> list[dict]:
     return normalize_places(data.get("places") if isinstance(data, dict) else data)
 
 
-async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str) -> int:
-    """认地点并写回; 返回认出的个数。任何异常只记日志。"""
+async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str, merge: bool = False) -> int:
+    """认地点并写回; 返回认出的个数。任何异常只记日志。
+    merge=True: 新内容是合并进已有记忆的, 认出的地点并进原有 places(不覆盖旧的)。"""
     if not getattr(dehydrator, "api_available", False):
         return 0
     try:
@@ -95,6 +96,10 @@ async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str) ->
         return 0
 
     def _fn(post, _p=places):
+        if merge:
+            if not _p:
+                return False
+            _p = normalize_places(list(post.get("places") or []) + _p)
         post["places"] = _p
         # 城市名并进标签: 聊到"伦敦"时检索能直接命中在伦敦的记忆; 星图里同城记忆也会因共享标签连起来
         cities = [c for c in dict.fromkeys(pl["city"] for pl in _p) if c]

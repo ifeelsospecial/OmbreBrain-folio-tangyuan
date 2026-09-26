@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.compiled.js"></script>
+<script src="../island-ui.js"></script>
+<title>关于你</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
+<link rel="stylesheet" href="../island-ui.css" />
+<style>
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 30px; }
+  .tally { display: flex; gap: 22px; }
+  .tally div { text-align: right; }
+  .tally b { display: block; font: italic 500 40px/1 var(--serif-en); color: var(--pg-accent); }
+  .tally span { font: 12px var(--sans); color: var(--pg-soft); letter-spacing: .06em; }
+
+  .watch { margin-bottom: 34px; }
+  .sec-hd { display: flex; align-items: baseline; gap: 10px; margin: 0 0 12px; }
+  .sec-hd h2 { font: 600 17px var(--serif-cn); margin: 0; }
+  .sec-hd small { font: italic 16px var(--serif-en); color: var(--pg-soft); }
+  .watch-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .wcard { padding: 14px 16px; border-radius: 16px; border: 1px dashed color-mix(in srgb, var(--pg-accent) 35%, var(--pg-line));
+    background: color-mix(in srgb, var(--pg-paper) 70%, transparent); animation: rise .35s both cubic-bezier(.2,.8,.2,1); }
+  .wcard .asp { font: 600 11px var(--sans); letter-spacing: .14em; color: var(--pg-accent); margin-bottom: 6px; }
+  .wcard .t { font-size: 15.5px; line-height: 1.7; margin-bottom: 12px; }
+  .wcard .row { display: flex; gap: 8px; align-items: center; }
+  .wcard .from { margin-left: auto; font: italic 14px var(--serif-en); color: var(--pg-faint); }
+  .mini { font: 13px var(--sans); min-height: 34px; padding: 0 13px; border-radius: 10px; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; }
+  .asp-card { padding: 20px 20px 14px; position: relative; animation: rise .45s both cubic-bezier(.2,.8,.2,1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+  .asp-hd { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .asp-ic { width: 36px; height: 36px; border-radius: 12px; display: grid; place-items: center; color: var(--pg-accent);
+    background: color-mix(in srgb, var(--pg-accent) 10%, transparent); flex: none; }
+  .asp-ic svg { width: 19px; height: 19px; }
+  .asp-hd h3 { font: 600 18px var(--serif-cn); margin: 0; }
+  .asp-hd .en { font: italic 15px var(--serif-en); color: var(--pg-faint); margin-left: auto; }
+  .entries { list-style: none; margin: 0; padding: 0; }
+  .entries li { position: relative; display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-top: 1px solid var(--pg-line); }
+  .entries li:first-child { border-top: 0; }
+  .entries .dot { width: 5px; height: 5px; border-radius: 50%; background: var(--pg-accent); margin-top: 11px; flex: none; opacity: .7; }
+  .entries .t { flex: 1; font-size: 15.5px; line-height: 1.7; word-break: break-word; }
+  .entries .src { font: italic 12.5px var(--serif-en); color: var(--pg-faint); white-space: nowrap; margin-top: 4px; }
+  .entries .acts { position: absolute; right: 0; top: 6px; display: flex; gap: 2px; opacity: 0; transition: opacity .2s;
+    background: var(--pg-paper); border-radius: 10px; box-shadow: -10px 0 12px var(--pg-paper); pointer-events: none; }
+  .entries li:hover .acts, .entries li:focus-within .acts { pointer-events: auto; }
+  .entries li:hover .acts, .entries li:focus-within .acts { opacity: 1; }
+  @media (hover: none) { .entries .acts { position: static; opacity: .7; pointer-events: auto; box-shadow: none; background: none; } }
+  .icon-btn { width: 30px; height: 30px; border-radius: 9px; border: 0; background: transparent; color: var(--pg-soft); cursor: pointer; display: grid; place-items: center; }
+  .icon-btn:hover { background: color-mix(in srgb, var(--pg-accent) 10%, transparent); color: var(--pg-ink); }
+  .icon-btn svg { width: 15px; height: 15px; }
+  .empty-line { color: var(--pg-faint); font-size: 14.5px; padding: 6px 0 10px; font-style: normal; }
+  .add { display: flex; gap: 8px; margin-top: 10px; }
+  .add .field { padding: 8px 12px; font-size: 14.5px; border-radius: 10px; }
+  .edit-field { width: 100%; }
+
+  .hero { text-align: center; padding: 50px 20px 40px; margin-bottom: 30px; }
+  .hero .big { font: 600 22px var(--serif-cn); margin: 12px 0 8px; }
+  .hero p { color: var(--pg-soft); max-width: 460px; margin: 0 auto 22px; }
+  .hero svg { width: 90px; height: 90px; color: var(--pg-accent); opacity: .55; }
+  .prog { max-width: 320px; margin: 16px auto 0; font: 13px var(--sans); color: var(--pg-soft); }
+  .prog .bar { height: 3px; border-radius: 3px; background: var(--pg-line); margin-top: 8px; overflow: hidden; }
+  .prog .bar i { display: block; height: 100%; background: var(--pg-accent); width: 0; transition: width .6s; }
+  .foot { max-width: 620px; margin: 40px auto 0; text-align: center; font: 13px/1.9 var(--sans); color: var(--pg-faint); }
+</style>
+</head>
+<body>
+<main class="pg">
+  <div id="top"></div>
+  <header class="head">
+    <div>
+      <p class="pg-eyebrow">About You</p>
+      <h1 class="pg-title">关于你</h1>
+      <p class="pg-sub">What I've come to know.</p>
+    </div>
+    <div class="tally" id="tally"></div>
+  </header>
+  <section id="hero"></section>
+  <section class="watch" id="watch" hidden></section>
+  <section class="grid" id="grid" aria-live="polite"></section>
+  <p class="foot">
+    这里是他对你稳定的了解：喜欢什么、讨厌什么、需要什么。已经确定的部分，每次聊天一开始他都会带着。<br>
+    他刚记下的先「观察着」，在另一天又听到同样的事才定下来；你点「对」，当场就定。说错了随时改。
+  </p>
+</main>
+<script>
+(function () {
+  const { esc, api, toast } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('about');
+  const ICONS = {
+    travel: '<path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z"/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/>',
+    sights: '<rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="m3.5 16 5-5 4 4 3-3 5 5"/><circle cx="15.5" cy="9" r="1.3"/>',
+    food: '<path d="M3.5 11h17a8.5 8.5 0 0 1-17 0Z"/><path d="M8 7c0-1.5 1-2 1-3.5M12 7c0-1.5 1-2 1-3.5M16 7c0-1.5 1-2 1-3.5"/>',
+    avoid: '<circle cx="12" cy="12" r="8.5"/><path d="m6 6 12 12"/>',
+    comfort: '<path d="M12 20s-7.5-4.6-7.5-10A4.3 4.3 0 0 1 12 7.4 4.3 4.3 0 0 1 19.5 10c0 5.4-7.5 10-7.5 10Z"/>',
+    talk: '<path d="M20 11.5a7.5 7.5 0 0 1-10.8 6.7L4 19.5l1.4-4.6A7.5 7.5 0 1 1 20 11.5Z"/>',
+    daily: '<circle cx="12" cy="12" r="4"/><path d="M12 2.5v2M12 19.5v2M4.6 4.6l1.4 1.4M18 18l1.4 1.4M2.5 12h2M19.5 12h2M4.6 19.4 6 18M18 6l1.4-1.4"/>',
+  };
+  const EN = { travel: 'pace', sights: 'what moves you', food: 'taste', avoid: 'no, thanks', comfort: 'when it hurts', talk: 'how you speak', daily: 'your days' };
+  const SRC = { her: 'by you', him: 'noticed', memory: 'from memories' };
+  const svg = (p, w = 1.6) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  const I_EDIT = svg('<path d="M4 20h4L19 9l-4-4L4 16v4Z"/>'), I_DEL = svg('<path d="M5 7h14M10 7V5h4v2M7 7l1 13h8l1-13"/>');
+  let state = null, poll = null;
+
+  async function act(body, okMsg) {
+    try {
+      await api('/api/about', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (okMsg) toast(okMsg);
+      await load();
+    } catch (e) { toast('没保存上：' + e.message); }
+  }
+
+  function render() {
+    const all = state.aspects.flatMap(a => a.entries.map(e => ({ ...e, aspect: a.key, label: a.label })));
+    const confirmed = all.filter(e => e.status === 'confirmed'), watching = all.filter(e => e.status !== 'confirmed');
+    document.getElementById('tally').innerHTML = all.length
+      ? `<div><b>${confirmed.length}</b><span>已经确定</span></div><div><b>${watching.length}</b><span>还在观察</span></div>` : '';
+
+    const d = state.draft || {};
+    const hero = document.getElementById('hero');
+    if (d.running) {
+      const pct = d.batches ? Math.round(d.done_batches / d.batches * 100) : 0;
+      hero.innerHTML = `<div class="hero paper"><div class="big">正在从记忆里整理……</div>
+        <p>他在一页一页翻你们的记忆，找那些反复出现的喜好。</p>
+        <div class="prog">${d.done_batches || 0} / ${d.batches || '…'}<div class="bar"><i style="width:${pct}%"></i></div></div></div>`;
+      clearTimeout(poll); poll = setTimeout(load, 5000);
+    } else if (!all.length) {
+      hero.innerHTML = `<div class="hero paper">${svg('<circle cx="12" cy="8.5" r="3.5"/><path d="M5 20c.8-3.8 3.6-6 7-6s6.2 2.2 7 6"/>', 1.2)}
+        <div class="big">他还不太了解你</div>
+        <p>可以让他先从你们的记忆里整理一版，你来挑对的；也可以直接在下面每一栏里写几句。</p>
+        <button class="btn primary" id="draft">让他从记忆里整理一版</button>
+        ${d.last_error ? `<div class="prog" style="color:var(--pg-warm)">上次没整理完：${esc(d.last_error)}</div>` : ''}</div>`;
+      document.getElementById('draft').onclick = async () => {
+        try { await api('/api/about/draft', { method: 'POST' }); toast('开始整理了，大概要几分钟'); load(); }
+        catch (e) { toast('没开始：' + e.message); }
+      };
+    } else hero.innerHTML = '';
+
+    const w = document.getElementById('watch');
+    w.hidden = !watching.length;
+    w.innerHTML = watching.length ? `<div class="sec-hd"><h2>他在观察的</h2><small>is this you?</small></div>
+      <div class="watch-list">${watching.map(e => `
+        <div class="wcard" data-id="${esc(e.id)}"><div class="asp">${esc(e.label)}</div><div class="t">${esc(e.text)}</div>
+          <div class="row"><button class="btn primary mini" data-a="confirm">对</button><button class="btn mini" data-a="edit">改一下</button>
+            <button class="btn mini" data-a="remove">不对</button><span class="from">${SRC[e.source] || ''}</span></div></div>`).join('')}</div>` : '';
+    w.querySelectorAll('.wcard').forEach(card => card.querySelectorAll('button').forEach(b => b.onclick = () => {
+      const id = card.dataset.id, a = b.dataset.a;
+      if (a === 'confirm') act({ action: 'confirm', id }, '定下来了');
+      if (a === 'remove') act({ action: 'remove', id }, '划掉了');
+      if (a === 'edit') editInPlace(card.querySelector('.t'), id);
+    }));
+
+    document.getElementById('grid').innerHTML = state.aspects.map((a, i) => {
+      const rows = a.entries.filter(e => e.status === 'confirmed');
+      return `<article class="asp-card paper" data-key="${a.key}" style="animation-delay:${i * 40}ms">
+        <div class="asp-hd"><div class="asp-ic">${svg(ICONS[a.key] || '')}</div><h3>${esc(a.label)}</h3><span class="en">${EN[a.key] || ''}</span></div>
+        <ul class="entries">${rows.length ? rows.map(e => `<li data-id="${esc(e.id)}"><span class="dot"></span><span class="t">${esc(e.text)}</span>
+            <span class="src">${SRC[e.source] || ''}</span><span class="acts"><button class="icon-btn" data-a="edit" aria-label="改">${I_EDIT}</button>
+            <button class="icon-btn" data-a="remove" aria-label="删">${I_DEL}</button></span></li>`).join('')
+          : '<li class="empty-line">还没有。</li>'}</ul>
+        <form class="add"><input class="field" maxlength="${state.max_text}" placeholder="加一句……" aria-label="给「${esc(a.label)}」加一句" />
+          <button class="btn mini" type="submit">加</button></form></article>`;
+    }).join('');
+    document.querySelectorAll('.asp-card').forEach(card => {
+      card.querySelector('.add').onsubmit = e => {
+        e.preventDefault();
+        const inp = card.querySelector('.add input');
+        const text = inp.value.trim();
+        if (text) act({ action: 'add', aspect: card.dataset.key, text }, '记下了');
+      };
+      card.querySelectorAll('li[data-id]').forEach(li => li.querySelectorAll('.icon-btn').forEach(b => b.onclick = () => {
+        if (b.dataset.a === 'remove') act({ action: 'remove', id: li.dataset.id }, '删掉了');
+        else editInPlace(li.querySelector('.t'), li.dataset.id);
+      }));
+    });
+  }
+
+  function editInPlace(el, id) {
+    const old = el.textContent;
+    el.innerHTML = `<input class="field edit-field" maxlength="${state.max_text}" value="${esc(old)}" aria-label="改这一句" />`;
+    const inp = el.querySelector('input');
+    inp.focus(); inp.select();
+    const done = save => { if (save && inp.value.trim() && inp.value.trim() !== old) act({ action: 'revise', id, text: inp.value.trim() }, '改好了'); else el.textContent = old; };
+    inp.onkeydown = e => { if (e.key === 'Enter') done(true); if (e.key === 'Escape') done(false); };
+    inp.onblur = () => done(true);
+  }
+
+  async function load() {
+    try { state = await api('/api/about'); render(); }
+    catch (e) { document.getElementById('grid').innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="big">没能读到</div><div>${esc(e.message)} · 刷新一下试试</div></div>`; }
+  }
+  load();
+})();
+</script>
+</body>
+</html>

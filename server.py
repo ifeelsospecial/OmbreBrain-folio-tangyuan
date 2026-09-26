@@ -97,6 +97,8 @@ embedding_outbox = EmbeddingOutbox(config, bucket_mgr, embedding_engine)
 bucket_mgr.attach_embedding_outbox(embedding_outbox)
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 from families import FamilyManager
+from about import AboutStore, AboutError, ASPECT_KEYS as _ABOUT_KEYS  # 「关于你」偏好档案
+about_store = AboutStore(bucket_mgr.base_dir)
 family_mgr = FamilyManager(bucket_mgr.base_dir, embedding_engine, bucket_mgr, dehydrator)  # 记忆家族/归纳层
 
 # --- /api/buckets in-memory cache / 内存级缓存 ---
@@ -410,7 +412,7 @@ async def breath_hook(request):
         except Exception:
             pass
 
-        # 快到的约定放最前(最该先想起), 一个月/一年前的今天放最后; 都不进权重池
+        # 快到的约定放最前(最该先想起), 一个月/一年前的今天放最后; 都不进权重池; 「关于她」档案放在最最前面
         try:
             for due, delta, pb in reversed(_upcoming_plans(all_buckets)):
                 parts.insert(0, f"📅 约好的事 · {due.isoformat()}（{_due_phrase(delta)}）：{strip_wikilinks(pb.get('content', ''))}")
@@ -430,6 +432,12 @@ async def breath_hook(request):
                                  f"（dashboard 的 /v2/review/）看看，哪些放下、哪些留着。")
         except Exception as e:
             logger.warning(f"breath-hook extra sections failed: {e}")
+        try:
+            _about = about_store.render_for_model()
+            if _about:
+                parts.insert(0, _about)
+        except Exception as e:
+            logger.warning(f"breath-hook about section failed: {e}")
 
         if not parts:
             return PlainTextResponse("")
@@ -834,6 +842,10 @@ async def _merge_or_create(
                 if raw_source and raw_source.strip():
                     update_kwargs["raw_source"] = _append_raw_source(bucket["metadata"].get("raw_source"), raw_source)
                 await bucket_mgr.update(bucket["id"], **update_kwargs)
+                if not test_data:
+                    # 合并进来的新内容可能提到新地方(网页端"今天去了泰特"并进了"伦敦旅行"), 认出来并进原有地点
+                    _schedule_place_extraction(bucket["id"], content, bucket["metadata"].get("domain") or domain,
+                                               bucket_type=bucket["metadata"].get("type", "dynamic"), merge=True)
                 return bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
@@ -884,7 +896,7 @@ def _append_raw_source(existing, new: str) -> str:
     return combined
 
 
-def _schedule_place_extraction(bucket_id: str, content: str, domain, bucket_type: str = "dynamic") -> None:
+def _schedule_place_extraction(bucket_id: str, content: str, domain, bucket_type: str = "dynamic", merge: bool = False) -> None:
     """新建桶后后台认地点(足迹地图)。只对出行领域/带去向字眼的记忆调 AI; 失败只记日志。"""
     try:
         from places import should_extract, attach_places
@@ -893,7 +905,7 @@ def _schedule_place_extraction(bucket_id: str, content: str, domain, bucket_type
             return
         if not should_extract({"type": bucket_type, "domain": list(domain or [])}, content):
             return
-        task = asyncio.create_task(attach_places(bucket_mgr, dehydrator, bucket_id, content))
+        task = asyncio.create_task(attach_places(bucket_mgr, dehydrator, bucket_id, content, merge=merge))
         _BG_TASKS.add(task)
         task.add_done_callback(_BG_TASKS.discard)
     except Exception as e:
@@ -1603,10 +1615,14 @@ async def _breath_impl(
                     summary = strip_wikilinks(db.get("content", ""))[:300]
                 day_lines.append(f"🕰 {title} [bucket_id:{db['id']}] {summary}")
 
-        if not pinned_results and not protected_results and not dynamic_results and not plan_lines and not day_lines:
+        if (not pinned_results and not protected_results and not dynamic_results and not plan_lines
+                and not day_lines and not about_store.render_for_model()):
             return "权重池平静，没有需要处理的记忆。"
 
         parts = []
+        about_text = about_store.render_for_model()
+        if about_text:
+            parts.append(about_text)
         if plan_lines:
             parts.append("=== 快到的约定 ===\n" + "\n".join(plan_lines))
         if pinned_results:
@@ -1930,6 +1946,43 @@ async def _feel_search(query: str = "", max_tokens: int = 10000, date_from: str 
         return notice + f"相关的 feel 太长，放不进 max_tokens={max_tokens}，调大一点再试。"
     tail = f"\n（另有 {omitted} 条相关 feel 因长度省略）" if omitted else ""
     return notice + "=== 相关的 feel ===\n" + "\n---\n".join(parts) + tail
+
+
+@mcp.tool()
+async def you(
+    aspect: str = "",
+    text: str = "",
+    entry_id: str = "",
+    confirm: bool = False,
+    revise: str = "",
+    remove: bool = False,
+    read: bool = False,
+) -> str:
+    """我对她的了解（偏好档案）。已确定的部分每次开场会自动带上，不用自己读。
+聊天里发现她【稳定的】偏好、习惯、雷区、低落时需要什么，就记一句：you(aspect="food", text="偏爱酸辣，不爱甜")。一次性的事件用 hold，不记在这里。
+aspect：travel 旅行节奏 / sights 爱看什么 / food 吃的口味 / avoid 不喜欢·雷区 / comfort 低落时需要什么 / talk 说话习惯 / daily 生活习惯。
+刚记下的是「观察中」；在另一天又看到同样的事，用 you(entry_id="…", confirm=True) 确认，攒够 2 个不同的日子就定下来。她说你理解错了：you(entry_id="…", revise="新说法") 或 remove=True。
+you(read=True) 看全部（含观察中的和 id）。"""
+    try:
+        if read or not (text or entry_id):
+            return about_store.render_for_model(include_watching=True)
+        if entry_id:
+            if remove:
+                return "删掉了。" if await about_store.remove(entry_id.strip()) else f"找不到 {entry_id}"
+            if revise:
+                e = await about_store.revise(entry_id.strip(), revise, by="him")
+                return f"改好了：{e['text']}"
+            if confirm:
+                e = await about_store.confirm(entry_id.strip(), by="him")
+                state = "定下来了" if e["status"] == "confirmed" else f"记下了（{len(e['seen'])}/{2} 天）"
+                return f"{state}：{e['text']}"
+            return "传了 entry_id，要配 confirm=True、revise=\"…\" 或 remove=True。"
+        e = await about_store.add(aspect, text, source="him")
+        if e["status"] == "confirmed":
+            return f"已经确定的：{e['text']}"
+        return f"记下了，先观察着：{e['text']} [id:{e['id']}]"
+    except AboutError as err:
+        return str(err)
 
 
 # =============================================================
@@ -3824,6 +3877,66 @@ async def api_notes(request):
     _schedule_place_extraction(bucket_id, content, [topic or "知识"])
     _invalidate_buckets_cache()
     return JSONResponse({"ok": True, "note": _note_row(await bucket_mgr.get(bucket_id))})
+
+
+# --- 「关于你」档案(本 fork 新增) ---
+_ABOUT_DRAFT: dict = {"running": False, "batches": 0, "done_batches": 0, "added": 0, "errors": 0,
+                      "last_error": "", "started_at": "", "finished_at": ""}
+
+
+@mcp.custom_route("/api/about", methods=["GET", "POST"])
+async def api_about(request):
+    """GET 整份档案; POST {action: add|confirm|revise|remove, ...} —— 页面上都是她本人操作, 改动当场定下。"""
+    from starlette.responses import JSONResponse
+    if request.method == "GET":
+        return JSONResponse({**about_store.as_json(), "draft": dict(_ABOUT_DRAFT)})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    action = str((body or {}).get("action") or "")
+    try:
+        if action == "add":
+            e = await about_store.add(body.get("aspect"), body.get("text"), source="her", confirmed=True)
+        elif action == "confirm":
+            e = await about_store.confirm(str(body.get("id") or ""), by="her")
+        elif action == "revise":
+            e = await about_store.revise(str(body.get("id") or ""), body.get("text"), by="her")
+        elif action == "remove":
+            if not await about_store.remove(str(body.get("id") or "")):
+                return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+            return JSONResponse({"ok": True})
+        else:
+            return JSONResponse({"ok": False, "error": "action 只能是 add / confirm / revise / remove"}, status_code=400)
+    except AboutError as err:
+        return JSONResponse({"ok": False, "error": str(err)}, status_code=400)
+    return JSONResponse({"ok": True, "entry": e})
+
+
+@mcp.custom_route("/api/about/draft", methods=["GET", "POST"])
+async def api_about_draft(request):
+    """GET 查进度; POST 后台用 AI 从现有记忆提炼第一版(全部是观察中, 她审过才定)。?pause= 同其他批量任务。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    if request.method == "GET" or _ABOUT_DRAFT.get("running"):
+        return JSONResponse(dict(_ABOUT_DRAFT))
+    from about import draft_from_memories
+    pause_s, _ = _pacing_params(request)
+    _ABOUT_DRAFT.update({"running": True, "started_at": _dt.utcnow().isoformat(timespec="seconds") + "Z", "finished_at": ""})
+
+    async def _run():
+        try:
+            await draft_from_memories(bucket_mgr, dehydrator, about_store, _ABOUT_DRAFT, pause_s=pause_s)
+        except Exception as e:
+            _ABOUT_DRAFT["last_error"] = f"{type(e).__name__}: {e}"[:300]
+        finally:
+            _ABOUT_DRAFT["running"] = False
+            _ABOUT_DRAFT["finished_at"] = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+
+    task = asyncio.create_task(_run())
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return JSONResponse({**_ABOUT_DRAFT, "started": True}, status_code=202)
 
 
 @mcp.custom_route("/api/families", methods=["GET"])

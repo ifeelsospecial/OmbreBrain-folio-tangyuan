@@ -49,6 +49,7 @@ function NavBarV2({ active = 'timeline' }) {
       <a href="/v2/console/breath/">Breath 模拟</a>
       <a href="/v2/console/config/">配置</a>
       <a href="/v2/console/safety/">数据安全</a>
+      <a href="/v2/about/">关于你</a>
       <a href="/v2/map/">足迹地图</a>
       <a href="/v2/notes/">知识本</a>
       <a href="/v2/review/">每周回顾</a>
