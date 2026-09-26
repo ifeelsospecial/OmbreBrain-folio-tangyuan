@@ -57,7 +57,7 @@ from embedding_engine import EmbeddingEngine
 from embedding_outbox import EmbeddingOutbox
 from import_memory import ImportEngine
 from media_store import MediaPersistenceError
-from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, atomic_write_text, atomic_update_config_yaml, coerce_bool, filesystem_turn, _win_long_path
+from utils import load_config, setup_logging, strip_wikilinks, count_tokens_approx, is_internalized, is_protected, is_highlighted, is_knowledge, atomic_write_text, atomic_update_config_yaml, coerce_bool, filesystem_turn, _win_long_path
 from backup_utils import build_backup_payload
 from restore_utils import BackupRestoreError, apply_verified_restore, create_pre_restore_backup, inspect_backup_checkout, public_restore_report
 from oauth_manager import OAuthError, OAuthManager
@@ -330,6 +330,7 @@ async def breath_hook(request):
         protected_only_hook = [b for b in all_buckets
                                if is_protected(b["metadata"])
                                and not is_highlighted(b["metadata"])
+                               and not is_knowledge(b["metadata"])
                                and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
                                and not b["metadata"].get("anchor", False)
                                and not b["metadata"].get("dont_surface", False)]
@@ -339,6 +340,7 @@ async def breath_hook(request):
                       and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "i")
                       and not is_highlighted(b["metadata"])
                       and not is_internalized(b["metadata"])
+                      and not is_knowledge(b["metadata"])
                       and not b["metadata"].get("anchor", False)
                       and not b["metadata"].get("dont_surface", False)]
         scored = sorted(unresolved, key=lambda b: decay_engine.calculate_score(b["metadata"]), reverse=True)
@@ -960,7 +962,7 @@ def _on_this_day(all_buckets: list, today=None, exclude_ids: set | None = None) 
         same_day = []
         for b in all_buckets:
             meta = b.get("metadata") or {}
-            if (meta.get("type") in _ON_THIS_DAY_EXCLUDED or b["id"] in exclude_ids
+            if (meta.get("type") in _ON_THIS_DAY_EXCLUDED or b["id"] in exclude_ids or is_knowledge(meta)
                     or is_internalized(meta) or meta.get("dont_surface") or _is_noise_meta(meta)):
                 continue
             if _bucket_day(meta) == target:
@@ -1026,8 +1028,8 @@ def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
     rows = []
     for b in all_buckets:
         meta = b.get("metadata") or {}
-        # 导入的(别处带来的背景经历)和她在 dashboard 亲手写的, 都不拿来问"要不要放下"
-        if meta.get("created_by") in ("import", "user"):
+        # 导入的(别处带来的背景经历)和她在 dashboard 亲手写的, 都不拿来问"要不要放下"; 知识也不问
+        if meta.get("created_by") in ("import", "user") or is_knowledge(meta):
             continue
         if (meta.get("type", "dynamic") != "dynamic" or meta.get("resolved") or is_protected(meta)
                 or is_highlighted(meta) or is_internalized(meta) or meta.get("anchor") or meta.get("dont_surface")):
@@ -1064,6 +1066,31 @@ def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
     for r in rows:
         r.pop("_rank", None)
     return rows[:limit]
+
+
+def _note_row(b: dict) -> dict:
+    """知识本条目的统一视图(页面与 breath 通道共用)。主题取第一个领域。"""
+    meta = b.get("metadata") or {}
+    domains = [str(d) for d in (meta.get("domain") or []) if d and str(d) != "未分类"]
+    tags = [str(t) for t in (meta.get("tags") or [])
+            if str(t).strip().lower() not in ("handbook", "知识") and not str(t).startswith("__")]
+    day = _bucket_day(meta)
+    try:
+        from places import normalize_places
+        cities = sorted({p["city"] or p["name"] for p in normalize_places(meta.get("places"))})
+    except Exception:
+        cities = []
+    return {
+        "id": b["id"],
+        "title": meta.get("name") or strip_wikilinks(str(b.get("content") or ""))[:20],
+        "content": strip_wikilinks(str(b.get("content") or "")),
+        "topic": domains[0] if domains else "其他",
+        "tags": tags[:6],
+        "day": day.isoformat() if day else "",
+        "cities": cities,
+        "mine": meta.get("created_by") == "user",
+        "pinned": bool(is_highlighted(meta)),
+    }
 
 
 def _relations_for_api(meta: dict) -> list:
@@ -1315,6 +1342,34 @@ async def _breath_impl(
             logger.error(f"Feel retrieval failed: {e}")
             return "读取 feel 失败。"
 
+    # --- 知识本通道(本 fork): domain="知识"/"handbook" 按主题列出全部知识条目, 逐字返回 ---
+    if domain.strip().lower() in ("知识", "知识本", "handbook", "knowledge"):
+        try:
+            all_buckets = await bucket_mgr.list_all(include_archive=False)
+        except Exception as e:
+            logger.error(f"Knowledge retrieval failed: {e}")
+            return "读取知识本失败。"
+        notes = [_note_row(b) for b in all_buckets
+                 if is_knowledge(b.get("metadata") or {}) and (b.get("metadata") or {}).get("type") != "trashed"
+                 and _bucket_in_date_range(b.get("metadata") or {}, date_lo, date_hi)]
+        if not notes:
+            return "知识本还是空的。"
+        by_topic: dict = {}
+        for n in notes:
+            by_topic.setdefault(n["topic"], []).append(n)
+        lines, used = [f"=== 知识本 · {len(notes)} 条 ==="], 0
+        for topic in sorted(by_topic, key=lambda t: -len(by_topic[t])):
+            lines.append(f"\n【{topic}】")
+            for n in sorted(by_topic[topic], key=lambda x: x["day"], reverse=True):
+                where = f"（{'、'.join(n['cities'])}）" if n["cities"] else ""
+                entry = f"· {n['title']}{where} [bucket_id:{n['id']}]\n  {n['content']}"
+                used += count_tokens_approx(entry)
+                if used > max_tokens:
+                    lines.append("…（后面还有，按关键词用 breath_search 找）")
+                    return "\n".join(lines)
+                lines.append(entry)
+        return "\n".join(lines)
+
     # --- Plan 通道(对齐上游 3.0.0 修复): domain="plan" 直接列进行中的 plan ---
     # 此前 plan 桶被普通浮现排除, domain 又只在 catalog/检索里生效, 不带 query 调用会落进浮现模式,
     # 返回核心准则 + 高权重桶而不是 plan。逐字返回, 不调 LLM, 已 resolved/abandoned 的不返回。
@@ -1383,6 +1438,7 @@ async def _breath_impl(
             b for b in all_buckets
             if is_protected(b["metadata"])
             and not is_highlighted(b["metadata"])
+            and not is_knowledge(b["metadata"])
             and b["metadata"].get("type") not in ("feel", "plan", "letter", "i")
             and not b["metadata"].get("anchor", False)
             and not b["metadata"].get("dont_surface", False)
@@ -1405,6 +1461,7 @@ async def _breath_impl(
             and b["metadata"].get("type") not in ("permanent", "feel", "plan", "letter", "i")
             and not is_highlighted(b["metadata"])
             and not is_internalized(b["metadata"])
+            and not is_knowledge(b["metadata"])   # 知识只在搜索/知识本里出现, 不进日常浮现
             and not b["metadata"].get("anchor", False)
             and not b["metadata"].get("dont_surface", False)
             and _bucket_in_date_range(b["metadata"], date_lo, date_hi)
@@ -3075,6 +3132,7 @@ async def dream() -> str:
         and not b["metadata"].get("anchor", False)
         and not b["metadata"].get("dont_surface", False)
         and not (b["metadata"].get("resolved", False) and b["metadata"].get("importance", 5) == 1)
+        and not is_knowledge(b["metadata"])   # 知识不拿来"消化"
     ]
 
     # --- Sort by creation time desc, take top 10 ---
@@ -3644,8 +3702,8 @@ async def api_review_decide(request):
         return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
     bid = str((body or {}).get("id") or "").strip()
     action = str((body or {}).get("action") or "").strip().lower()
-    if action not in ("resolve", "keep") or not bid:
-        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep)"}, status_code=400)
+    if action not in ("resolve", "keep", "undo") or not bid:
+        return JSONResponse({"ok": False, "error": "需要 id 和 action(resolve/keep/undo)"}, status_code=400)
     if not await bucket_mgr.get(bid):
         return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
     if action == "resolve":
@@ -3653,6 +3711,18 @@ async def api_review_decide(request):
             post["resolved"] = True
             post["resolved_by"] = "weekly-review"
             return True
+    elif action == "undo":
+        # 撤销刚才在回顾页做的决定: 只撤回顾页自己写下的标记, 不碰别处设的 resolved
+        def _fn(post):
+            changed = False
+            if post.get("resolved_by") == "weekly-review":
+                post["resolved"] = False
+                del post.metadata["resolved_by"]
+                changed = True
+            if "review_keep_until" in post.metadata:
+                del post.metadata["review_keep_until"]
+                changed = True
+            return changed
     else:
         until = (_dt.utcnow().date() + _td(days=_REVIEW_KEEP_DAYS)).isoformat()
 
@@ -3661,7 +3731,7 @@ async def api_review_decide(request):
             return True
     ok = await bucket_mgr.rewrite_bucket_metadata(bid, _fn)
     _invalidate_buckets_cache()
-    return JSONResponse({"ok": bool(ok), "id": bid, "action": action})
+    return JSONResponse({"ok": bool(ok) or action == "undo", "id": bid, "action": action})
 
 
 # --- 足迹地图(本 fork 新增) ---
@@ -3703,6 +3773,42 @@ async def api_places_backfill(request):
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
     return JSONResponse({**_PLACES_BACKFILL, "started": True}, status_code=202)
+
+
+@mcp.custom_route("/api/notes", methods=["GET", "POST"])
+async def api_notes(request):
+    """知识本。GET 列出全部条目; POST {title, content, topic?} 新增一条(她亲手写, created_by=user)。"""
+    from starlette.responses import JSONResponse
+    if request.method == "GET":
+        buckets = await bucket_mgr.list_all(include_archive=False)
+        notes = [_note_row(b) for b in buckets
+                 if is_knowledge(b.get("metadata") or {}) and (b.get("metadata") or {}).get("type") != "trashed"]
+        notes.sort(key=lambda n: n["day"], reverse=True)
+        topics: dict = {}
+        for n in notes:
+            topics[n["topic"]] = topics.get(n["topic"], 0) + 1
+        return JSONResponse({"notes": notes, "topics": sorted(topics.items(), key=lambda kv: -kv[1])})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    title = str((body or {}).get("title") or "").strip()[:60]
+    content = str((body or {}).get("content") or "").strip()
+    topic = str((body or {}).get("topic") or "").strip()[:20]
+    if not content:
+        return JSONResponse({"ok": False, "error": "内容不能是空的"}, status_code=400)
+    size_error = _payload_size_error("知识条目", content, "max_bucket_bytes", 50 * 1024)
+    if size_error:
+        return JSONResponse({"ok": False, "error": size_error}, status_code=400)
+    tags = ["handbook"] + ([topic] if topic else [])
+    bucket_id = await bucket_mgr.create(
+        content=content, tags=tags, importance=7, domain=[topic or "知识"],
+        name=title or content[:20], created_by="user", source_tool="notes",
+    )
+    _schedule_relation_link(bucket_id, content)
+    _schedule_place_extraction(bucket_id, content, [topic or "知识"])
+    _invalidate_buckets_cache()
+    return JSONResponse({"ok": True, "note": _note_row(await bucket_mgr.get(bucket_id))})
 
 
 @mcp.custom_route("/api/families", methods=["GET"])

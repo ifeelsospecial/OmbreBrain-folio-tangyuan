@@ -96,6 +96,11 @@ async def attach_places(bucket_mgr, dehydrator, bucket_id: str, content: str) ->
 
     def _fn(post, _p=places):
         post["places"] = _p
+        # 城市名并进标签: 聊到"伦敦"时检索能直接命中在伦敦的记忆; 星图里同城记忆也会因共享标签连起来
+        cities = [c for c in dict.fromkeys(pl["city"] for pl in _p) if c]
+        if cities:
+            old = [str(t) for t in (post.get("tags") or [])]
+            post["tags"] = old + [c for c in cities if c not in old]
         return True
 
     try:
@@ -135,7 +140,7 @@ async def backfill_places(bucket_mgr, dehydrator, progress: dict, pause_s: float
 
 def aggregate(buckets: list) -> list[dict]:
     """按城市(没有城市就按地点名)聚合成地图上的点; 坐标取该城市下各地点的平均。"""
-    from utils import parse_iso_datetime
+    from utils import parse_iso_datetime, is_knowledge
     groups: dict = {}
     for b in buckets:
         meta = b.get("metadata") or {}
@@ -160,7 +165,8 @@ def aggregate(buckets: list) -> list[dict]:
                 g["spots"].add(p["name"])
             # 同一条记忆在同一个城市只算一次(一段记忆里提到同城的两个景点很常见)
             g["memories"].setdefault(b["id"], {"id": b["id"], "name": meta.get("name") or b["id"], "day": day,
-                                               "spot": p["name"] if p["name"] != key[0] else ""})
+                                               "spot": p["name"] if p["name"] != key[0] else "",
+                                               "note": is_knowledge(meta)})
     out = []
     for g in groups.values():
         mems = sorted(g["memories"].values(), key=lambda m: m["day"], reverse=True)
@@ -168,6 +174,7 @@ def aggregate(buckets: list) -> list[dict]:
             "city": g["city"], "country": g["country"],
             "lat": round(sum(g["lats"]) / len(g["lats"]), 5), "lon": round(sum(g["lons"]) / len(g["lons"]), 5),
             "spots": sorted(g["spots"]), "count": len(mems), "memories": mems,
+            "notes": sum(1 for m in mems if m["note"]),
             "first": mems[-1]["day"] if mems else "", "last": mems[0]["day"] if mems else "",
         })
     out.sort(key=lambda g: -g["count"])

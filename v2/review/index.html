@@ -5,143 +5,208 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <script src="../auth-token.js"></script>
 <script src="../theme-system.compiled.js"></script>
+<script src="../island-ui.js"></script>
 <title>每周回顾</title>
 <link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
+<link rel="stylesheet" href="../island-ui.css" />
 <style>
-  :root {
-    --bg: #f4f3f7; --paper: #ffffff; --ink: #1a1922; --ink-3: #6d6a7c; --ink-4: #a6a3b3;
-    --accent: #6e4f9a; --rose: #d291b3; --line: rgba(26, 25, 34, 0.08);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #1a1820; --paper: #23212b; --ink: #ebe9ee; --ink-3: #9c98a8; --ink-4: #6d6a7c;
-      --accent: #b39ad8; --rose: #d291b3; --line: rgba(235, 233, 238, 0.08);
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
-  }
-  main { max-width: 680px; margin: 0 auto; padding: 28px 16px 64px; }
-  header { margin-bottom: 20px; }
-  h1 { font-size: 22px; font-weight: 600; margin: 0 0 6px; letter-spacing: 0.01em; }
-  .lede { color: var(--ink-3); margin: 0; }
-  .count { color: var(--accent); font-weight: 600; }
-  .card {
-    background: var(--paper); border: 1px solid var(--line); border-radius: 14px;
-    padding: 14px 16px; margin: 0 0 12px; transition: opacity .25s, transform .25s;
-  }
-  .card.leaving { opacity: 0; transform: translateX(12px); }
-  .meta { display: flex; flex-wrap: wrap; gap: 6px 10px; font-size: 12.5px; color: var(--ink-3); margin-bottom: 4px; }
-  .name { font-weight: 600; margin: 0 0 4px; }
-  .preview { color: var(--ink); opacity: .85; margin: 0 0 12px; word-break: break-word; }
-  .actions { display: flex; gap: 8px; }
-  button {
-    font: inherit; font-size: 14px; border-radius: 10px; padding: 8px 14px; cursor: pointer;
-    border: 1px solid var(--line); background: transparent; color: var(--ink); min-height: 40px;
-  }
-  button.let-go { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button:disabled { opacity: .5; cursor: default; }
-  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .empty, .error { text-align: center; color: var(--ink-3); padding: 48px 8px; }
-  .error { color: var(--rose); }
-  .more { display: block; margin: 16px auto 0; }
-  footer { margin-top: 28px; font-size: 12.5px; color: var(--ink-4); }
-  a { color: var(--accent); }
+  .head { text-align: center; margin: 8px auto 28px; max-width: 560px; }
+  .progress { margin: 20px auto 0; max-width: 360px; font: 13px var(--sans); color: var(--pg-soft); }
+  .bar { height: 3px; border-radius: 3px; background: var(--pg-line); overflow: hidden; margin-top: 8px; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--pg-accent); border-radius: 3px; transition: width .5s cubic-bezier(.2,.8,.2,1); }
+
+  .deck { position: relative; max-width: 540px; margin: 0 auto 26px; perspective: 1200px; }
+  .ghost { position: absolute; left: 0; right: 0; top: 0; height: 100%; border-radius: var(--pg-radius);
+    background: var(--pg-paper); border: 1px solid var(--pg-line); }
+  .ghost.g1 { transform: translateY(12px) scale(.965); opacity: .6; }
+  .ghost.g2 { transform: translateY(22px) scale(.93); opacity: .3; }
+  .card { position: relative; z-index: 2; padding: 26px 26px 22px; touch-action: pan-y; user-select: none;
+    transition: transform .55s cubic-bezier(.2,.8,.2,1), opacity .5s, filter .5s; will-change: transform; }
+  .card.enter { animation: rise .45s cubic-bezier(.2,.8,.2,1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(18px) scale(.98); } }
+  .card.sink { transform: translateY(70px) scale(.94); opacity: 0; filter: blur(6px); }
+  .card.lift { transform: translateY(-60px) rotate(-2deg) scale(.97); opacity: 0; }
+  .card.drag { transition: none; }
+
+  .stamp { display: flex; align-items: flex-end; gap: 12px; margin-bottom: 16px; }
+  .stamp .day { font: italic 500 58px/0.85 var(--serif-en); color: var(--pg-accent); }
+  .stamp .my { font: 600 11px/1.5 var(--sans); letter-spacing: .18em; color: var(--pg-soft); }
+  .stamp .ago { margin-left: auto; font: italic 17px var(--serif-en); color: var(--pg-faint); }
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+  .tags span { font: 12px/1 var(--sans); padding: 5px 10px; border-radius: 999px; color: var(--pg-soft);
+    background: color-mix(in srgb, var(--pg-accent) 7%, transparent); }
+  .name { font: 600 21px/1.4 var(--serif-cn); margin: 0 0 10px; }
+  .body { font-size: 16px; line-height: 1.85; color: color-mix(in srgb, var(--pg-ink) 86%, transparent); margin: 0; word-break: break-word; }
+  .imp { margin-top: 18px; display: flex; gap: 4px; align-items: center; font: 12px var(--sans); color: var(--pg-faint); }
+  .imp i { width: 14px; height: 3px; border-radius: 2px; background: var(--pg-line); }
+  .imp i.on { background: color-mix(in srgb, var(--pg-accent) 60%, transparent); }
+
+  .hint-l, .hint-r { position: absolute; top: 22px; font: 600 12px var(--sans); letter-spacing: .15em; padding: 6px 10px;
+    border-radius: 8px; opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .hint-l { right: 22px; color: var(--pg-soft); border: 1.5px solid var(--pg-soft); }
+  .hint-r { left: 22px; color: var(--pg-accent); border: 1.5px solid var(--pg-accent); }
+
+  .actions { display: flex; justify-content: center; gap: 12px; margin: 22px auto 0; max-width: 540px; }
+  .actions .btn { flex: 1; max-width: 200px; }
+  .keys { text-align: center; margin-top: 14px; font: 12px var(--sans); color: var(--pg-faint); }
+  .keys kbd { font: 11px var(--sans); border: 1px solid var(--pg-line); border-radius: 5px; padding: 1px 6px; }
+  @media (hover: none) { .keys { display: none; } }
+
+  .done { text-align: center; padding: 40px 16px; }
+  .done .big { font: 600 24px var(--serif-cn); margin: 10px 0 6px; }
+  .done .tally { font: italic 20px var(--serif-en); color: var(--pg-soft); margin-bottom: 26px; }
+  .foot { max-width: 540px; margin: 46px auto 0; font: 13px/1.8 var(--sans); color: var(--pg-faint); text-align: center; }
 </style>
 </head>
 <body>
-<main>
-  <header>
-    <h1>每周回顾</h1>
-    <p class="lede" id="lede">正在找可能已经过去的事…</p>
+<main class="pg">
+  <div id="top"></div>
+  <header class="head">
+    <p class="pg-eyebrow">Weekly Review</p>
+    <h1 class="pg-title">每周回顾</h1>
+    <p class="pg-sub">Let the tide carry some away.</p>
+    <div class="progress" id="progress" hidden>
+      <div id="progress-text"></div>
+      <div class="bar"><i id="bar"></i></div>
+    </div>
   </header>
-  <section id="list" aria-live="polite"></section>
-  <button class="more" id="more" hidden>再看一批</button>
-  <footer>
-    这里列的是两周前发生、最近两周也没再被想起、重要度 6 以下的普通记忆，最不重要的排在前面。导入的旧记忆和你亲手写的不会出现。
-    <b>放下</b>：它会沉底，不再主动浮现，关键词仍能搜到，之后随衰减移进归档区，可以在 dashboard 恢复。
-    <b>留着</b>：两个月内不再问。
-    钉选、保护、坐标、feel、约定和信件都不会出现在这里。
-  </footer>
+  <section id="stage" aria-live="polite"></section>
+  <p class="foot">
+    这里是两周前发生、最近两周也没再想起、不太重要的日常小事。<br />
+    放下，它会沉底，不再主动浮上来，但还能搜到，也能在归档区找回；留着，两个月内不再问。<br />
+    钉选的、坐标、知识、约定、信件、导入的旧记忆和你亲手写的，都不会出现在这里。
+  </p>
 </main>
 <script>
 (function () {
-  const list = document.getElementById('list');
-  const lede = document.getElementById('lede');
-  const more = document.getElementById('more');
-  let remaining = 0;
+  const { esc, api, toast, fmtDay } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('review');
+  const stage = document.getElementById('stage');
+  let queue = [], total = 0, batchSize = 0, done = 0, tally = { resolve: 0, keep: 0 }, busy = false;
 
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  function progress() {
+    const p = document.getElementById('progress');
+    if (!batchSize) { p.hidden = true; return; }
+    p.hidden = false;
+    document.getElementById('progress-text').innerHTML =
+      `这一批 <span class="pg-num">${done}</span> / <span class="pg-num">${batchSize}</span> · 一共还有 <span class="pg-num">${Math.max(0, total - done)}</span> 条`;
+    document.getElementById('bar').style.width = (done / batchSize * 100) + '%';
   }
 
-  function renderLede() {
-    lede.innerHTML = remaining > 0
-      ? `有 <span class="count">${remaining}</span> 条可能已经过去的事。哪些放下，哪些留着，你来定。`
-      : '这周没有需要回顾的旧事。';
+  function cardHTML(it) {
+    const d = fmtDay(it.day);
+    const imp = Array.from({ length: 10 }, (_, i) => `<i class="${i < it.importance ? 'on' : ''}"></i>`).join('');
+    return `
+      <span class="hint-r">留着</span><span class="hint-l">放下</span>
+      <div class="stamp"><span class="day">${esc(d.d)}</span><span class="my">${esc(d.m)}<br>${esc(d.y)}</span>
+        <span class="ago">${esc(it.age_days)} days ago</span></div>
+      ${(it.domain || []).length ? `<div class="tags">${it.domain.map(x => `<span>${esc(x)}</span>`).join('')}</div>` : ''}
+      <h2 class="name">${esc(it.name)}</h2>
+      <p class="body">${esc(it.preview)}${it.preview && it.preview.length >= 180 ? '…' : ''}</p>
+      <div class="imp" title="重要度 ${esc(it.importance)}">${imp}</div>`;
   }
 
-  async function load() {
-    list.innerHTML = '';
-    more.hidden = true;
-    try {
-      const r = await fetch('/api/review/candidates?limit=20');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      remaining = data.total || 0;
-      renderLede();
-      if (!data.items.length) {
-        list.innerHTML = '<p class="empty">都清爽了。</p>';
+  function render() {
+    progress();
+    if (!queue.length) {
+      if (!batchSize) {
+        stage.innerHTML = `<div class="empty"><svg viewBox="0 0 120 60" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M4 30c10-10 20-10 30 0s20 10 30 0 20-10 30 0 16 8 22 4"/><path d="M4 44c10-10 20-10 30 0s20 10 30 0 20-10 30 0 16 8 22 4" opacity=".5"/></svg>
+          <div class="big">都清爽了</div><div>这周没有需要回顾的旧事。</div></div>`;
         return;
       }
-      for (const it of data.items) list.appendChild(card(it));
-      more.hidden = remaining <= data.items.length;
-    } catch (e) {
-      lede.textContent = '';
-      list.innerHTML = `<p class="error">没能读到记忆（${esc(e.message)}）。刷新一下试试。</p>`;
+      stage.innerHTML = `<div class="done paper" style="max-width:540px;margin:0 auto">
+          <p class="pg-eyebrow">Done</p><div class="big">这一批整理完了</div>
+          <div class="tally">放下 ${tally.resolve} · 留着 ${tally.keep}</div>
+          ${total - done > 0 ? '<button class="btn primary" id="again">再来一批</button>' : '<div>剩下的，下周再说。</div>'}</div>`;
+      const again = document.getElementById('again');
+      if (again) again.onclick = load;
+      return;
     }
-  }
-
-  function card(it) {
-    const el = document.createElement('article');
-    el.className = 'card';
-    el.innerHTML = `
-      <div class="meta"><span>${esc(it.day)}</span><span>${esc(it.age_days)} 天前</span>
-        <span>${esc((it.domain || []).join(' · '))}</span><span>重要度 ${esc(it.importance)}</span></div>
-      <p class="name">${esc(it.name)}</p>
-      <p class="preview">${esc(it.preview)}</p>
+    const it = queue[0];
+    stage.innerHTML = `
+      <div class="deck">
+        ${queue.length > 2 ? '<div class="ghost g2"></div>' : ''}${queue.length > 1 ? '<div class="ghost g1"></div>' : ''}
+        <article class="card paper enter" id="card" tabindex="-1" aria-label="${esc(it.name)}">${cardHTML(it)}</article>
+      </div>
       <div class="actions">
-        <button class="let-go" data-act="resolve">放下</button>
-        <button data-act="keep">留着</button>
-      </div>`;
-    el.querySelectorAll('button').forEach(btn => btn.addEventListener('click', () => decide(el, it.id, btn.dataset.act)));
-    return el;
+        <button class="btn" id="let-go">放下</button>
+        <button class="btn primary" id="keep">留着</button>
+      </div>
+      <div class="keys"><kbd>←</kbd> 放下 · <kbd>→</kbd> 留着</div>`;
+    document.getElementById('let-go').onclick = () => decide('resolve');
+    document.getElementById('keep').onclick = () => decide('keep');
+    swipe(document.getElementById('card'));
   }
 
-  async function decide(el, id, action) {
-    el.querySelectorAll('button').forEach(b => (b.disabled = true));
+  async function decide(action) {
+    if (busy || !queue.length) return;
+    busy = true;
+    const it = queue[0];
+    const card = document.getElementById('card');
+    card.classList.remove('drag');
+    card.style.transform = '';
+    card.classList.add(action === 'resolve' ? 'sink' : 'lift');
     try {
-      const r = await fetch('/api/review/decide', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, action }),
-      });
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      el.classList.add('leaving');
-      setTimeout(() => {
-        el.remove();
-        remaining = Math.max(0, remaining - 1);
-        renderLede();
-        if (!list.children.length) load();
-      }, 250);
+      await api('/api/review/decide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id, action }) });
+      await new Promise(r => setTimeout(r, 420));
+      queue.shift(); done++; tally[action]++;
+      render();
+      toast(action === 'resolve' ? '放下了' : '留着 · 两个月后再问', { label: '撤销', run: () => undo(it, action) });
     } catch (e) {
-      el.querySelectorAll('button').forEach(b => (b.disabled = false));
-      alert('没保存上：' + e.message);
+      card.classList.remove('sink', 'lift');
+      toast('没保存上：' + e.message);
+    } finally { busy = false; }
+  }
+
+  async function undo(it, action) {
+    try {
+      await api('/api/review/decide', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: it.id, action: 'undo' }) });
+      queue.unshift(it); done--; tally[action]--;
+      render();
+    } catch (e) { toast('没撤销成功：' + e.message); }
+  }
+
+  function swipe(card) {
+    let x0 = null, dx = 0;
+    const hl = card.querySelector('.hint-l'), hr = card.querySelector('.hint-r');
+    card.addEventListener('pointerdown', e => { if (e.pointerType === 'mouse' && e.button !== 0) return; x0 = e.clientX; dx = 0; card.classList.add('drag'); card.setPointerCapture(e.pointerId); });
+    card.addEventListener('pointermove', e => {
+      if (x0 === null) return;
+      dx = e.clientX - x0;
+      card.style.transform = `translateX(${dx}px) rotate(${dx / 28}deg)`;
+      hl.style.opacity = Math.min(1, Math.max(0, -dx / 90));
+      hr.style.opacity = Math.min(1, Math.max(0, dx / 90));
+    });
+    const end = () => {
+      if (x0 === null) return;
+      x0 = null;
+      hl.style.opacity = hr.style.opacity = 0;
+      if (Math.abs(dx) > 110) decide(dx < 0 ? 'resolve' : 'keep');
+      else { card.classList.remove('drag'); card.style.transform = ''; }
+    };
+    card.addEventListener('pointerup', end);
+    card.addEventListener('pointercancel', end);
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.target.closest('input, textarea')) return;
+    if (e.key === 'ArrowLeft') decide('resolve');
+    if (e.key === 'ArrowRight') decide('keep');
+  });
+
+  async function load() {
+    stage.innerHTML = '<div class="empty">正在翻找……</div>';
+    try {
+      const data = await api('/api/review/candidates?limit=20');
+      queue = data.items || []; total = data.total || 0; batchSize = queue.length; done = 0; tally = { resolve: 0, keep: 0 };
+      render();
+    } catch (e) {
+      stage.innerHTML = `<div class="empty"><div class="big">没能读到记忆</div><div>${esc(e.message)} · 刷新一下试试</div></div>`;
     }
   }
-
-  more.addEventListener('click', load);
   load();
 })();
 </script>

@@ -13,7 +13,7 @@
 |------|-----------|
 | `breath` | **每次对话最开头**调用一次（不传参数）——就像睁眼看手机，看看有没有未解决的事浮上来 |
 | `breath_search` | 有明确话题时传 `query` 关键词检索；可选 `domain`、`max_results`，`date_from` / `date_to` 按事情发生的日期筛选；`quotes=True` 连同当时存下的原话一起返回。检索是只读的，不会让记忆变重 |
-| `breath_advanced` | 按时间翻全部 feel（`domain="feel"`）、看进行中的计划（`domain="plan"`）、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
+| `breath_advanced` | 按时间翻全部 feel（`domain="feel"`）、看进行中的计划（`domain="plan"`）、按主题翻知识本（`domain="知识"`）、情绪坐标检索、`catalog=True` 紧凑目录或自定义 token 预算时使用 |
 | `feel` | 按关键词找你以前留下的 feel：`feel(query="她搬家那天")`，只返回相关的，逐字原文 |
 | `hold` | 你想记住当下发生的单个事件，或想存储一条信息时。`feel=True` 写你的第一人称感受，`source_bucket` 指向被消化的记忆，`valence` 是你自己的感受 |
 | `grow` | 当**一天结束时**或**用户发来一大段日记/总结**时调用。你可以把其中**你想记住的事件**扔进去，它会自动拆分整理成多个记忆盒子存进你的大脑 |

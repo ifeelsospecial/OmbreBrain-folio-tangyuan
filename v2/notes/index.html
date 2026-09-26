@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.compiled.js"></script>
+<script src="../island-ui.js"></script>
+<title>知识本</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
+<link rel="stylesheet" href="../island-ui.css" />
+<style>
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 22px; }
+  .count { font: italic 500 46px/1 var(--serif-en); color: var(--pg-accent); text-align: right; }
+  .count small { display: block; font: 12px var(--sans); font-style: normal; color: var(--pg-soft); letter-spacing: .08em; margin-top: 4px; }
+  .tools { position: sticky; top: 0; z-index: 5; padding: 12px 16px; margin: 0 -16px 8px;
+    background: color-mix(in srgb, var(--pg-bg) 72%, transparent);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  .search { position: relative; margin-bottom: 12px; }
+  .search svg { position: absolute; left: 14px; top: 50%; width: 17px; height: 17px; transform: translateY(-50%); color: var(--pg-faint); }
+  .search .field { padding-left: 42px; border-radius: 999px; }
+  .topics { display: flex; gap: 7px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; }
+  .topics::-webkit-scrollbar { display: none; }
+
+  .grid { columns: 3 280px; column-gap: 16px; }
+  .note { break-inside: avoid; margin: 0 0 16px; padding: 18px 18px 14px; cursor: pointer; position: relative; overflow: hidden;
+    transition: transform .25s cubic-bezier(.2,.8,.2,1), box-shadow .25s; animation: rise .4s both cubic-bezier(.2,.8,.2,1); }
+  .note:hover { transform: translateY(-3px); }
+  .note::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; background: var(--c); opacity: .75; }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+  .note-topic { font: 600 11px var(--sans); letter-spacing: .14em; color: var(--c); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+  .note-title { font: 600 17.5px/1.45 var(--serif-cn); margin: 0 0 8px; }
+  .note-body { font-size: 14.5px; line-height: 1.8; color: color-mix(in srgb, var(--pg-ink) 80%, transparent); margin: 0;
+    display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden; white-space: pre-line; }
+  .note-foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; font: 12px var(--sans); color: var(--pg-faint); flex-wrap: wrap; }
+  .note-foot .city { color: var(--pg-accent); }
+  .note-foot .mine { margin-left: auto; font-family: var(--serif-en); font-style: italic; font-size: 14px; }
+  mark { background: color-mix(in srgb, var(--pg-warm) 35%, transparent); color: inherit; border-radius: 3px; padding: 0 1px; }
+
+  .fab { position: fixed; right: calc(20px + env(safe-area-inset-right)); bottom: calc(22px + env(safe-area-inset-bottom)); z-index: 20;
+    border-radius: 999px; padding: 0 22px; min-height: 52px; box-shadow: 0 10px 30px color-mix(in srgb, var(--pg-accent) 35%, transparent); }
+
+  .reader-topic { font: 600 11px var(--sans); letter-spacing: .16em; color: var(--c); margin: 6px 0 10px; }
+  .reader h2 { font: 600 24px/1.4 var(--serif-cn); margin: 0 0 16px; }
+  .reader .text { font-size: 16.5px; line-height: 1.95; white-space: pre-line; word-break: break-word; }
+  .reader .meta { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--pg-line); display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font: 13px var(--sans); color: var(--pg-soft); }
+  .reader .meta a { color: var(--pg-accent); text-decoration: none; }
+
+  .form label { display: block; font: 600 12px var(--sans); letter-spacing: .1em; color: var(--pg-soft); margin: 16px 0 7px; }
+  .form textarea { min-height: 150px; resize: vertical; }
+  .form .row { display: flex; gap: 7px; flex-wrap: wrap; }
+  .form .submit { margin-top: 22px; width: 100%; }
+  .form .err { color: #c0605a; font: 13px var(--sans); margin-top: 10px; min-height: 1em; }
+</style>
+</head>
+<body>
+<main class="pg">
+  <div id="top"></div>
+  <header class="head">
+    <div>
+      <p class="pg-eyebrow">Field Notes</p>
+      <h1 class="pg-title">知识本</h1>
+      <p class="pg-sub">Things worth keeping.</p>
+    </div>
+    <div class="count" id="count" hidden></div>
+  </header>
+  <div class="tools">
+    <div class="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="M20 20l-4-4"/></svg>
+      <input class="field" id="q" type="search" placeholder="找找以前学到的……" aria-label="搜索知识本" />
+    </div>
+    <div class="topics" id="topics" role="toolbar" aria-label="按主题筛选"></div>
+  </div>
+  <section class="grid" id="grid" aria-live="polite"></section>
+</main>
+<button class="btn primary fab" id="add">＋ 记一条</button>
+
+<div class="sheet-wrap" id="reader-wrap" aria-hidden="true">
+  <div class="sheet reader" role="dialog" aria-modal="true" aria-label="知识条目" id="reader"></div>
+</div>
+<div class="sheet-wrap" id="form-wrap" aria-hidden="true">
+  <form class="sheet form" id="form" role="dialog" aria-modal="true" aria-label="记一条知识">
+    <div class="sheet-grip"></div>
+    <p class="pg-eyebrow">New note</p>
+    <h2 class="pg-title" style="font-size:22px">记一条</h2>
+    <label for="f-title">标题</label>
+    <input class="field" id="f-title" maxlength="60" placeholder="比如：德国火车要先打卡" />
+    <label for="f-content">内容</label>
+    <textarea class="field" id="f-content" placeholder="学到了什么？在哪学到的？下次怎么用？" required></textarea>
+    <label>主题</label>
+    <div class="row" id="f-topics"></div>
+    <input class="field" id="f-topic" maxlength="20" placeholder="或者写一个新主题" style="margin-top:8px" />
+    <div class="err" id="f-err"></div>
+    <button class="btn primary submit" type="submit" id="f-submit">收进知识本</button>
+  </form>
+</div>
+
+<script>
+(function () {
+  const { esc, api, toast, hue } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('notes');
+  let notes = [], topics = [], active = '', q = '';
+  const grid = document.getElementById('grid');
+
+  function highlight(text) {
+    const safe = esc(text);
+    if (!q) return safe;
+    const re = new RegExp(q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    return safe.replace(re, m => `<mark>${m}</mark>`);
+  }
+
+  function renderTopics() {
+    const box = document.getElementById('topics');
+    box.innerHTML = [['', '全部', notes.length], ...topics.map(([t, n]) => [t, t, n])].map(([key, label, n]) =>
+      `<button class="chip" aria-pressed="${key === active}" data-topic="${esc(key)}" style="${key ? `color:${hue(key)}` : ''}">
+         ${key ? '<span class="dot"></span>' : ''}<span style="color:var(--pg-ink)">${esc(label)}</span><span class="n">${n}</span></button>`).join('');
+    box.querySelectorAll('.chip').forEach(b => b.onclick = () => { active = b.dataset.topic; renderTopics(); renderGrid(); });
+  }
+
+  function renderGrid() {
+    const ql = q.toLowerCase();
+    const list = notes.filter(n => (!active || n.topic === active) &&
+      (!ql || (n.title + n.content + n.tags.join(' ') + n.cities.join(' ')).toLowerCase().includes(ql)));
+    if (!notes.length) {
+      grid.style.columns = 'auto';
+      grid.innerHTML = `<div class="empty"><svg viewBox="0 0 120 60" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><rect x="38" y="8" width="44" height="44" rx="4"/><path d="M46 20h28M46 28h28M46 36h18"/></svg>
+        <div class="big">知识本还是空的</div><div>旅途里、日常里学到的东西，点右下角记下来。<br>他教你的方法，也会自动收进来。</div></div>`;
+      return;
+    }
+    grid.style.columns = '';
+    if (!list.length) { grid.innerHTML = '<div class="empty" style="column-span:all">没找到。换个词试试？</div>'; return; }
+    grid.innerHTML = list.map((n, i) => `
+      <article class="note paper" data-id="${esc(n.id)}" style="--c:${hue(n.topic)};animation-delay:${Math.min(i, 12) * 30}ms" tabindex="0">
+        <div class="note-topic">${esc(n.topic)}</div>
+        <h3 class="note-title">${highlight(n.title)}</h3>
+        <p class="note-body">${highlight(n.content)}</p>
+        <div class="note-foot"><span>${esc(n.day)}</span>
+          ${n.cities.map(c => `<span class="city">· ${esc(c)}</span>`).join('')}
+          ${n.mine ? '<span class="mine">by you</span>' : ''}</div>
+      </article>`).join('');
+    grid.querySelectorAll('.note').forEach(el => {
+      el.onclick = () => openReader(el.dataset.id);
+      el.onkeydown = e => { if (e.key === 'Enter') openReader(el.dataset.id); };
+    });
+  }
+
+  function sheet(id, open) {
+    const w = document.getElementById(id);
+    w.classList.toggle('open', open);
+    w.setAttribute('aria-hidden', String(!open));
+  }
+  ['reader-wrap', 'form-wrap'].forEach(id => document.getElementById(id).addEventListener('click', e => { if (e.target.id === id) sheet(id, false); }));
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') { sheet('reader-wrap', false); sheet('form-wrap', false); } });
+
+  function openReader(id) {
+    const n = notes.find(x => x.id === id);
+    if (!n) return;
+    const r = document.getElementById('reader');
+    r.style.setProperty('--c', hue(n.topic));
+    r.innerHTML = `<div class="sheet-grip"></div><div class="reader-topic">${esc(n.topic)}</div>
+      <h2>${esc(n.title)}</h2><div class="text">${esc(n.content)}</div>
+      <div class="meta"><span>${esc(n.day)}</span>
+        ${n.cities.map(c => `<a href="/v2/map/?city=${encodeURIComponent(c)}">📍 ${esc(c)}</a>`).join('')}
+        ${n.tags.filter(t => !n.cities.includes(t) && t !== n.topic).map(t => `<span class="chip" style="cursor:default">${esc(t)}</span>`).join('')}
+        ${n.mine ? '<span style="margin-left:auto;font:italic 15px var(--serif-en)">by you</span>' : '<span style="margin-left:auto;font:italic 15px var(--serif-en)">from him</span>'}</div>`;
+    sheet('reader-wrap', true);
+  }
+
+  let pickedTopic = '';
+  function renderFormTopics() {
+    const box = document.getElementById('f-topics');
+    box.innerHTML = topics.slice(0, 10).map(([t]) =>
+      `<button type="button" class="chip" aria-pressed="${t === pickedTopic}" data-t="${esc(t)}" style="color:${hue(t)}"><span class="dot"></span><span style="color:var(--pg-ink)">${esc(t)}</span></button>`).join('');
+    box.querySelectorAll('.chip').forEach(b => b.onclick = () => {
+      pickedTopic = pickedTopic === b.dataset.t ? '' : b.dataset.t;
+      document.getElementById('f-topic').value = '';
+      renderFormTopics();
+    });
+  }
+  document.getElementById('add').onclick = () => {
+    pickedTopic = active || '';
+    renderFormTopics();
+    document.getElementById('f-err').textContent = '';
+    sheet('form-wrap', true);
+    setTimeout(() => document.getElementById('f-title').focus(), 250);
+  };
+  document.getElementById('f-topic').oninput = () => { pickedTopic = ''; renderFormTopics(); };
+  document.getElementById('form').onsubmit = async e => {
+    e.preventDefault();
+    const content = document.getElementById('f-content').value.trim();
+    if (!content) { document.getElementById('f-err').textContent = '内容还空着呢。'; return; }
+    const btn = document.getElementById('f-submit');
+    btn.disabled = true;
+    try {
+      const topic = document.getElementById('f-topic').value.trim() || pickedTopic;
+      const res = await api('/api/notes', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: document.getElementById('f-title').value.trim(), content, topic }) });
+      document.getElementById('form').reset();
+      sheet('form-wrap', false);
+      notes.unshift(res.note);
+      recount();
+      toast('收好了 · 他也能翻到');
+    } catch (err) {
+      document.getElementById('f-err').textContent = '没存上：' + err.message;
+    } finally { btn.disabled = false; }
+  };
+
+  function recount() {
+    const m = {};
+    notes.forEach(n => m[n.topic] = (m[n.topic] || 0) + 1);
+    topics = Object.entries(m).sort((a, b) => b[1] - a[1]);
+    const c = document.getElementById('count');
+    c.hidden = !notes.length;
+    c.innerHTML = `${notes.length}<small>条 · ${topics.length} 个主题</small>`;
+    renderTopics(); renderGrid();
+  }
+
+  let t;
+  document.getElementById('q').oninput = e => { clearTimeout(t); t = setTimeout(() => { q = e.target.value.trim(); renderGrid(); }, 120); };
+
+  (async function load() {
+    grid.innerHTML = '<div class="empty">正在翻开……</div>';
+    try {
+      const data = await api('/api/notes');
+      notes = data.notes || [];
+      recount();
+    } catch (e) {
+      grid.innerHTML = `<div class="empty"><div class="big">没能读到知识本</div><div>${esc(e.message)} · 刷新一下试试</div></div>`;
+    }
+  })();
+})();
+</script>
+</body>
+</html>

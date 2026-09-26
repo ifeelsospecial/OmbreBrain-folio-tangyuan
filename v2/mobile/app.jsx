@@ -3032,6 +3032,14 @@ function SettingScreen() {
             </div>
             <span className="setting-row-arrow">›</span>
           </div>
+          <div className="setting-row" onClick={() => { window.location.href = '/v2/notes/'; }}>
+            <div className="setting-row-ic">✎</div>
+            <div className="setting-row-mid">
+              <div className="setting-row-title">知识本</div>
+              <div className="setting-row-sub">旅途和日常里学到的东西</div>
+            </div>
+            <span className="setting-row-arrow">›</span>
+          </div>
           <div className="setting-row" onClick={() => { window.location.href = '/v2/review/'; }}>
             <div className="setting-row-ic">✓</div>
             <div className="setting-row-mid">

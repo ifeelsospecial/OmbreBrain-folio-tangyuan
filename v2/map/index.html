@@ -5,156 +5,211 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <script src="../auth-token.js"></script>
 <script src="../theme-system.compiled.js"></script>
-<title>足迹地图</title>
+<script src="../island-ui.js"></script>
+<title>足迹</title>
 <link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
 <link rel="stylesheet" href="./vendor/leaflet.min.css" />
+<link rel="stylesheet" href="../island-ui.css" />
 <style>
-  :root {
-    --bg: #f4f3f7; --paper: #ffffff; --ink: #1a1922; --ink-3: #6d6a7c; --ink-4: #a6a3b3;
-    --accent: #6e4f9a; --rose: #d291b3; --line: rgba(26, 25, 34, 0.08);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #1a1820; --paper: #23212b; --ink: #ebe9ee; --ink-3: #9c98a8; --ink-4: #6d6a7c;
-      --accent: #b39ad8; --rose: #d291b3; --line: rgba(235, 233, 238, 0.1);
-    }
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    background: var(--bg); color: var(--ink); display: flex; flex-direction: column;
-    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans SC", sans-serif;
-  }
-  header { padding: 14px 16px 10px; display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
-  h1 { font-size: 20px; font-weight: 600; margin: 0; }
-  .sum { color: var(--ink-3); font-size: 13.5px; }
-  .sum b { color: var(--accent); }
-  .wrap { flex: 1; display: flex; min-height: 0; }
-  #map { flex: 1; min-height: 320px; background: var(--bg); }
-  aside {
-    width: 340px; max-width: 42vw; overflow-y: auto; border-left: 1px solid var(--line);
-    background: var(--paper); padding: 14px 16px 24px;
-  }
-  .cities { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-  .chip {
-    font: inherit; font-size: 13px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
-    border: 1px solid var(--line); background: transparent; color: var(--ink);
-  }
-  .chip.on { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-  .city-hd { font-weight: 600; font-size: 17px; margin: 4px 0 2px; }
-  .city-sub { color: var(--ink-3); font-size: 12.5px; margin-bottom: 10px; }
-  .mem { padding: 9px 0; border-top: 1px solid var(--line); }
-  .mem-day { color: var(--ink-3); font-size: 12px; }
-  .mem-name { word-break: break-word; }
-  .mem-spot { color: var(--accent); font-size: 12.5px; }
-  .hint, .error { color: var(--ink-3); padding: 12px 0; }
-  .error { color: var(--rose); }
-  .leaflet-container { font: inherit; }
-  .tiles-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9); }
-  .leaflet-control-attribution { font-size: 10.5px; }
-  @media (max-width: 720px) {
-    .wrap { flex-direction: column; }
-    #map { flex: none; height: 55vh; }
-    aside { width: auto; max-width: none; border-left: 0; border-top: 1px solid var(--line); flex: 1; }
+  body { overflow: hidden; }
+  body::before { z-index: 1000; }
+  .shell { position: fixed; inset: 0; display: grid; grid-template-columns: 1fr 380px; }
+  #map { position: relative; z-index: 0; background: var(--pg-bg); }
+  .leaflet-container { font: inherit; background: var(--pg-bg); }
+  .leaflet-tile-pane { filter: grayscale(.45) sepia(.12) saturate(.9) brightness(1.04) contrast(.92); }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .leaflet-tile-pane { filter: invert(1) hue-rotate(185deg) grayscale(.35) brightness(.78) contrast(.92); } }
+  .leaflet-control-attribution { font: 10px var(--sans); background: color-mix(in srgb, var(--pg-paper) 70%, transparent) !important; }
+  .leaflet-control-zoom a { background: var(--pg-glass) !important; color: var(--pg-ink) !important; border-color: var(--pg-line) !important; backdrop-filter: blur(10px); }
+
+  .overlay { position: absolute; z-index: 500; left: 16px; top: 16px; right: 16px; pointer-events: none; display: flex; flex-direction: column; gap: 12px; align-items: flex-start; }
+  .overlay > * { pointer-events: auto; }
+  .overlay .pg-top { margin: 0; width: 100%; max-width: 520px; }
+  .title-card { border-radius: var(--pg-radius); padding: 16px 20px 14px; max-width: 520px; }
+  .stats { display: flex; gap: 22px; margin-top: 12px; }
+  .stat b { display: block; font: italic 500 34px/1 var(--serif-en); color: var(--pg-accent); }
+  .stat span { font: 12px var(--sans); color: var(--pg-soft); letter-spacing: .06em; }
+
+  /* 城市圆点 */
+  .city-pin { position: relative; }
+  .city-pin .dot { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); border-radius: 50%;
+    background: color-mix(in srgb, var(--pg-accent) 82%, transparent); color: var(--pg-paper); display: grid; place-items: center;
+    font: italic 500 15px/1 var(--serif-en); box-shadow: 0 0 0 3px color-mix(in srgb, var(--pg-paper) 85%, transparent), 0 6px 18px color-mix(in srgb, var(--pg-accent) 40%, transparent);
+    transition: transform .25s cubic-bezier(.2,.8,.2,1); cursor: pointer; }
+  .city-pin.on .dot { transform: translate(-50%, -50%) scale(1.22); background: var(--pg-accent); }
+  .city-pin .halo { position: absolute; left: 50%; top: 50%; border-radius: 50%; transform: translate(-50%, -50%);
+    border: 1.5px solid var(--pg-accent); animation: breathe 2.8s ease-out infinite; pointer-events: none; }
+  @keyframes breathe { from { opacity: .7; width: 100%; height: 100%; } to { opacity: 0; width: 260%; height: 260%; } }
+  .city-pin.quiet:not(.on) .label { opacity: 0; }
+  .city-pin .label { transition: opacity .2s; }
+  .city-pin .label { position: absolute; left: 50%; top: calc(50% + var(--r) + 6px); transform: translateX(-50%); white-space: nowrap;
+    font: 600 12.5px var(--serif-cn); color: var(--pg-ink); text-shadow: 0 0 3px var(--pg-paper), 0 0 6px var(--pg-paper); pointer-events: none; }
+  .journey { stroke: var(--pg-accent); stroke-width: 1.6; stroke-dasharray: 2 7; stroke-linecap: round; fill: none; opacity: .75; animation: flow 22s linear infinite; }
+  @keyframes flow { to { stroke-dashoffset: -180; } }
+
+  /* 侧栏 */
+  aside { position: relative; z-index: 600; overflow-y: auto; border-left: 1px solid var(--pg-line); padding: 26px 22px 40px;
+    background: color-mix(in srgb, var(--pg-paper) 88%, transparent); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }
+  .side-hd { font: 600 11px var(--sans); letter-spacing: .2em; color: var(--pg-accent); margin: 0 0 14px; text-transform: uppercase; }
+  .trip { list-style: none; margin: 0; padding: 0 0 0 18px; position: relative; }
+  .trip::before { content: ""; position: absolute; left: 4px; top: 8px; bottom: 8px; border-left: 1.5px dashed color-mix(in srgb, var(--pg-accent) 40%, transparent); }
+  .trip li { position: relative; padding: 9px 10px 9px 8px; margin-left: -8px; border-radius: 12px; cursor: pointer; transition: background .2s; }
+  .trip li:hover { background: color-mix(in srgb, var(--pg-accent) 7%, transparent); }
+  .trip li::before { content: ""; position: absolute; left: -13px; top: 17px; width: 9px; height: 9px; border-radius: 50%; background: var(--pg-paper); border: 2px solid var(--pg-accent); }
+  .trip .when { font: italic 15px var(--serif-en); color: var(--pg-soft); }
+  .trip .where { font: 600 16px var(--serif-cn); }
+  .trip .where small { font: 12px var(--sans); color: var(--pg-faint); margin-left: 6px; font-weight: 400; }
+  .trip .n { float: right; font: italic 18px var(--serif-en); color: var(--pg-accent); }
+
+  .city-name { font: 600 30px/1.2 var(--serif-cn); margin: 4px 0 2px; }
+  .city-sub { font: italic 17px var(--serif-en); color: var(--pg-soft); margin-bottom: 16px; }
+  .spots { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 20px; }
+  .spots span { font: 12.5px var(--sans); padding: 5px 10px; border-radius: 999px; background: color-mix(in srgb, var(--pg-warm) 14%, transparent); }
+  .group-hd { font: 600 12px var(--sans); letter-spacing: .14em; color: var(--pg-soft); margin: 22px 0 8px; }
+  .mem { padding: 12px 14px; border-radius: 14px; margin-bottom: 8px; background: var(--pg-paper); border: 1px solid var(--pg-line); }
+  .mem.note { border-left: 3px solid var(--pg-warm); }
+  .mem .d { font: italic 14px var(--serif-en); color: var(--pg-faint); }
+  .mem .t { font-size: 15px; line-height: 1.6; }
+  .mem .s { font: 12px var(--sans); color: var(--pg-accent); margin-top: 2px; }
+  .back-link { font: 13px var(--sans); color: var(--pg-soft); background: none; border: 0; cursor: pointer; padding: 0; margin-bottom: 12px; }
+  .back-link:hover { color: var(--pg-accent); }
+
+  @media (max-width: 820px) {
+    body { overflow: auto; }
+    .shell { position: static; display: block; }
+    #map { height: 62vh; min-height: 360px; }
+    aside { border-left: 0; border-top: 1px solid var(--pg-line); border-radius: 22px 22px 0 0; margin-top: -22px; min-height: 40vh; padding-top: 22px; }
+    .overlay { left: 12px; right: 12px; top: 12px; }
+    .title-card { padding: 10px 14px; display: flex; align-items: center; gap: 16px; }
+    .title-card .pg-eyebrow { display: none; }
+    .title-card .pg-title { font-size: 20px !important; }
+    .stats { margin-top: 0; gap: 14px; }
+    .stat b { font-size: 22px; display: inline; margin-right: 3px; }
+    .stat span { font-size: 11px; }
   }
 </style>
 </head>
 <body>
-<header>
-  <h1>足迹地图</h1>
-  <span class="sum" id="sum">正在读取…</span>
-</header>
-<div class="wrap">
-  <div id="map" role="region" aria-label="足迹地图"></div>
-  <aside id="side" aria-live="polite">
-    <div class="cities" id="cities"></div>
-    <div id="detail"><p class="hint">点地图上的圆点或上面的城市，看在那里留下的记忆。</p></div>
-  </aside>
+<div class="shell">
+  <div id="map" role="region" aria-label="足迹地图">
+    <div class="overlay">
+      <div id="top" style="width:100%"></div>
+      <div class="title-card glass">
+        <p class="pg-eyebrow" style="margin-bottom:6px">Footprints</p>
+        <h1 class="pg-title" style="font-size:26px">足迹</h1>
+        <div class="stats" id="stats"><div class="stat"><span>正在展开地图……</span></div></div>
+      </div>
+    </div>
+  </div>
+  <aside id="side" aria-live="polite"></aside>
 </div>
 <script src="./vendor/leaflet.min.js"></script>
 <script>
 (function () {
-  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-  const dark = () => window.matchMedia('(prefers-color-scheme: dark)').matches && document.documentElement.dataset.theme !== 'light';
-
-  const map = L.map('map', { worldCopyJump: true, zoomControl: true }).setView([51.5, 0], 4);
-  // OpenStreetMap 公共底图(无需密钥); 深色模式用滤镜把底图压暗, 不另换一套瓦片
-  if (dark()) document.getElementById('map').classList.add('tiles-dark');
+  const { esc, api } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('map');
+  const side = document.getElementById('side');
+  const map = L.map('map', { worldCopyJump: true, zoomControl: false, attributionControl: true }).setView([51.5, 2], 5);
+  L.control.zoom({ position: 'bottomleft' }).addTo(map);
   L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 18,
-    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    maxZoom: 18, attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
   }).addTo(map);
 
-  const markers = new Map();
-  let active = null;
+  let places = [], byCity = new Map(), selected = null;
 
-  function radius(n) { return Math.min(22, 6 + Math.sqrt(n) * 4); }
-
-  function select(key, fly) {
-    const g = markers.get(key);
-    if (!g) return;
-    if (active) markers.get(active).circle.setStyle({ weight: 1.5, fillOpacity: 0.55 });
-    active = key;
-    g.circle.setStyle({ weight: 3, fillOpacity: 0.85 });
-    if (fly) map.flyTo([g.data.lat, g.data.lon], Math.max(map.getZoom(), 9), { duration: 0.8 });
-    document.querySelectorAll('.chip').forEach(c => c.classList.toggle('on', c.dataset.key === key));
-    const d = g.data;
-    const span = d.first && d.last && d.first !== d.last ? `${d.first} → ${d.last}` : (d.last || '');
-    document.getElementById('detail').innerHTML = `
-      <div class="city-hd">${esc(d.city)}</div>
-      <div class="city-sub">${esc(d.country)}${d.country ? ' · ' : ''}${d.count} 条记忆${span ? ' · ' + esc(span) : ''}</div>
-      ${d.memories.map(m => `
-        <div class="mem">
-          <div class="mem-day">${esc(m.day)}</div>
-          <div class="mem-name">${esc(m.name)}</div>
-          ${m.spot ? `<div class="mem-spot">${esc(m.spot)}</div>` : ''}
-        </div>`).join('')}`;
+  const small = () => window.matchMedia('(max-width: 820px)').matches;
+  function radius(n) { const r = Math.min(26, 11 + Math.sqrt(n) * 3.6); return Math.round(small() ? r * 0.68 : r); }
+  let labelled = new Set();   // 缩得很远时只给记忆最多的几座城标名字, 放大后全部显示
+  function syncLabels() {
+    const all = map.getZoom() >= 7;
+    document.querySelectorAll('.city-pin').forEach(el => el.classList.toggle('quiet', !all && !labelled.has(el.dataset.key)));
   }
 
-  async function load() {
+  function pin(p, recent) {
+    const r = radius(p.count);
+    return L.divIcon({
+      className: '', iconSize: [0, 0],
+      html: `<div class="city-pin" data-key="${esc(p.key)}" style="--r:${r}px">
+        ${recent ? `<span class="halo" style="width:${r * 2}px;height:${r * 2}px"></span>` : ''}
+        <span class="dot" style="width:${r * 2}px;height:${r * 2}px">${p.count}</span>
+        <span class="label">${esc(p.city)}</span></div>`,
+    });
+  }
+
+  function mark(key) {
+    document.querySelectorAll('.city-pin').forEach(el => el.classList.toggle('on', el.dataset.key === key));
+  }
+
+  function renderTrip() {
+    selected = null; mark(null);
+    const trip = [...places].sort((a, b) => (a.first || '').localeCompare(b.first || ''));
+    side.innerHTML = `<p class="side-hd">The Journey</p>
+      <ul class="trip">${trip.map(p => `
+        <li data-key="${esc(p.key)}"><span class="n">${p.count}</span>
+          <div class="when">${esc(p.first)}${p.last && p.last !== p.first ? ' — ' + esc(p.last) : ''}</div>
+          <div class="where">${esc(p.city)}<small>${esc(p.country)}</small></div></li>`).join('')}</ul>`;
+    side.querySelectorAll('.trip li').forEach(li => li.onclick = () => select(li.dataset.key, true));
+  }
+
+  function select(key, fly) {
+    const p = byCity.get(key);
+    if (!p) return;
+    selected = key; mark(key);
+    if (fly) map.flyTo([p.lat, p.lon], Math.max(map.getZoom(), 10), { duration: 0.9 });
+    const notes = p.memories.filter(m => m.note), mems = p.memories.filter(m => !m.note);
+    const item = m => `<div class="mem${m.note ? ' note' : ''}"><div class="d">${esc(m.day)}</div><div class="t">${esc(m.name)}</div>
+      ${m.spot ? `<div class="s">📍 ${esc(m.spot)}</div>` : ''}</div>`;
+    side.innerHTML = `<button class="back-link" id="back">← 全部旅程</button>
+      <p class="side-hd">${esc(p.country || 'Somewhere')}</p>
+      <div class="city-name">${esc(p.city)}</div>
+      <div class="city-sub">${esc(p.first)}${p.last && p.last !== p.first ? ' — ' + esc(p.last) : ''} · ${p.count} ${p.count > 1 ? 'memories' : 'memory'}</div>
+      ${p.spots.length ? `<div class="spots">${p.spots.map(s => `<span>${esc(s)}</span>`).join('')}</div>` : ''}
+      ${notes.length ? `<div class="group-hd">在这里学到的</div>${notes.map(item).join('')}` : ''}
+      ${mems.length ? `<div class="group-hd">在这里的记忆</div>${mems.map(item).join('')}` : ''}`;
+    document.getElementById('back').onclick = renderTrip;
+    side.scrollTop = 0;
+  }
+
+  (async function load() {
     try {
-      const r = await fetch('/api/places');
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const data = await r.json();
-      const places = data.places || [];
-      const sum = document.getElementById('sum');
+      const data = await api('/api/places');
+      places = (data.places || []).map((p, i) => ({ ...p, key: String(i) }));
+      places.forEach(p => byCity.set(p.key, p));
+      const stats = document.getElementById('stats');
       if (!places.length) {
-        sum.textContent = '还没有认出地点。';
-        document.getElementById('detail').innerHTML =
-          '<p class="hint">新存的出行记忆会自动认出地点；旧记忆需要跑一次「给存量记忆认地点」。</p>';
+        stats.innerHTML = '<div class="stat"><span>第一段足迹还在路上。</span></div>';
+        side.innerHTML = `<div class="empty" style="padding:40px 8px"><svg viewBox="0 0 120 60" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-dasharray="2 6"><path d="M8 48C30 10 60 50 80 22s30-6 32-10"/></svg>
+          <div class="big">还没有认出地点</div><div>新存的出行记忆会自动标上地点；<br>以前的记忆等跑完一次「认地点」就会出现。</div></div>`;
         return;
       }
       const countries = new Set(places.map(p => p.country).filter(Boolean));
-      sum.innerHTML = `<b>${places.length}</b> 个地方 · <b>${countries.size}</b> 个国家 · <b>${data.memories_with_places}</b> 条记忆`;
-      const accent = css('--accent') || '#6e4f9a';
-      const bounds = [];
-      const chips = document.getElementById('cities');
-      places.forEach((p, i) => {
-        const key = String(i);
-        const circle = L.circleMarker([p.lat, p.lon], {
-          radius: radius(p.count), color: accent, weight: 1.5, fillColor: accent, fillOpacity: 0.55,
-        }).addTo(map);
-        circle.bindTooltip(`${esc(p.city)} · ${p.count}`, { direction: 'top' });
-        circle.on('click', () => select(key, false));
-        markers.set(key, { circle, data: p });
-        bounds.push([p.lat, p.lon]);
-        const chip = document.createElement('button');
-        chip.className = 'chip';
-        chip.dataset.key = key;
-        chip.textContent = `${p.city} ${p.count}`;
-        chip.addEventListener('click', () => select(key, true));
-        chips.appendChild(chip);
-      });
-      if (bounds.length > 1) map.fitBounds(bounds, { padding: [30, 30], maxZoom: 7 });
-      else map.setView(bounds[0], 9);
+      stats.innerHTML = `<div class="stat"><b>${places.length}</b><span>座城市</span></div>
+        <div class="stat"><b>${countries.size}</b><span>个国家</span></div>
+        <div class="stat"><b>${data.memories_with_places}</b><span>段记忆</span></div>`;
+
+      const trip = [...places].sort((a, b) => (a.first || '').localeCompare(b.first || ''));
+      const latest = [...places].sort((a, b) => (b.last || '').localeCompare(a.last || ''))[0];
+      if (trip.length > 1) L.polyline(trip.map(p => [p.lat, p.lon]), { className: 'journey', interactive: false, smoothFactor: 1 }).addTo(map);
+      places.forEach(p => L.marker([p.lat, p.lon], { icon: pin(p, p === latest), keyboard: true, title: p.city, riseOnHover: true })
+        .on('click', () => select(p.key, false)).addTo(map));
+      labelled = new Set([...places].sort((a, b) => b.count - a.count).slice(0, 3).map(p => p.key));
+      map.on('zoomend', syncLabels);
+      const bounds = L.latLngBounds(places.map(p => [p.lat, p.lon]));
+      // 左上角的标题卡会盖住一块地图, 取景时把那块让出来
+      const pad = small() ? { paddingTopLeft: [24, 120], paddingBottomRight: [24, 30] } : { paddingTopLeft: [260, 110], paddingBottomRight: [60, 60] };
+      if (places.length > 1) map.fitBounds(bounds, { ...pad, maxZoom: 7 }); else map.setView(bounds.getCenter(), 10);
+      syncLabels();
+
+      renderTrip();
+      const want = new URLSearchParams(location.search).get('city');
+      if (want) { const hit = places.find(p => p.city === want); if (hit) select(hit.key, true); }
     } catch (e) {
-      document.getElementById('sum').textContent = '';
-      document.getElementById('detail').innerHTML = `<p class="error">没能读到足迹（${esc(e.message)}）。刷新一下试试。</p>`;
+      document.getElementById('stats').innerHTML = '';
+      side.innerHTML = `<div class="empty"><div class="big">没能读到足迹</div><div>${esc(e.message)} · 刷新一下试试</div></div>`;
     }
-  }
-  load();
+  })();
 })();
 </script>
 </body>

@@ -615,6 +615,17 @@ def normalize_event_time(s):
         return None
 
 
+KNOWLEDGE_TAGS = frozenset({"handbook", "知识"})
+
+
+def is_knowledge(meta: dict) -> bool:
+    """知识本条目: 带 handbook / 知识 标签的记忆(本 fork 约定)。
+    知识不随时间淡掉、不进日常浮现/做梦/每周回顾/那天, 只在搜索与知识本里出现。"""
+    if not isinstance(meta, dict):
+        return False
+    return any(str(t).strip().lower() in KNOWLEDGE_TAGS for t in (meta.get("tags") or []))
+
+
 def is_protected(meta: dict) -> bool:
     """读"防自动衰减归档"标记,兼容旧字段名 `pinned`。
     优先用新字段 `protected`,完全没设过才退回旧字段 `pinned`。

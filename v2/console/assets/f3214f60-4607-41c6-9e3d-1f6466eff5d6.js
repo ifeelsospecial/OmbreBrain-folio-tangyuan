@@ -45,6 +45,7 @@ function ConsoleNav({ active, trashCount = 0 }) {
     { id: 'safety',    label: '数据安全',   href: '/v2/console/safety/' },
     { id: 'operations', label: '部署连接',   href: '/v2/console/operations/' },
     { id: 'map',       label: '足迹地图',   href: '/v2/map/' },
+    { id: 'notes',     label: '知识本',     href: '/v2/notes/' },
     { id: 'review',    label: '每周回顾',   href: '/v2/review/' },
     { id: 'trash',     label: '回收站',     href: '/v2/console/trash/' },
   ];
