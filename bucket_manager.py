@@ -82,6 +82,8 @@ logger = logging.getLogger("ombre_brain.bucket")
 
 _MEANING_ITEM_MAX = 1000
 _MEANING_LIST_MAX_ITEMS = 20
+_HER_NOTES_MAX_ITEMS = 200
+_HER_NOTE_MAX = 2000
 _PLAN_CHANGE_LOG_MAX_ITEMS = 100
 _ANCHOR_LIMIT = 24
 
@@ -236,6 +238,11 @@ class BucketManager:
     @staticmethod
     def _normalize_meaning_item(value) -> str:
         return str(value or "").strip()[:_MEANING_ITEM_MAX]
+
+    @staticmethod
+    def _her_note_texts(meta: dict) -> list[str]:
+        """知识本「你的笔记」(her_notes) 跟 meaning 同一档参与检索, 让他搜得到她写的笔记。"""
+        return [str(n.get("text")) for n in (meta.get("her_notes") or []) if isinstance(n, dict) and n.get("text")]
 
     @classmethod
     def _normalize_meaning_list(cls, values) -> list[str]:
@@ -477,7 +484,7 @@ class BucketManager:
         meta = bucket.get("metadata", {}) or {}
         name = str(meta.get("name") or "")
         summary = str(meta.get("summary") or "")
-        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []))
+        meaning = " ".join(self._normalize_meaning_list(meta.get("meaning") or []) + self._her_note_texts(meta))
         why_remembered = str(meta.get("why_remembered") or "")
         content = str(bucket.get("content") or "")
         domain_str = " ".join(meta.get("domain") or [])
@@ -1386,6 +1393,15 @@ class BucketManager:
                 if len(existing_meanings) >= _MEANING_LIST_MAX_ITEMS:
                     raise ValueError(f"每条记忆最多保存 {_MEANING_LIST_MAX_ITEMS} 条 meaning。")
                 post["meaning"] = existing_meanings + [addition]
+        if "her_notes_append" in kwargs:
+            # 知识本详情页「你的笔记」: 她夹进这一页的笔记, 只追加 [{text, at}]
+            item = kwargs["her_notes_append"] or {}
+            text = str(item.get("text") or "").strip()[:_HER_NOTE_MAX]
+            if text:
+                existing = [n for n in (post.get("her_notes") or []) if isinstance(n, dict) and n.get("text")]
+                if len(existing) >= _HER_NOTES_MAX_ITEMS:
+                    raise ValueError(f"每页最多夹 {_HER_NOTES_MAX_ITEMS} 条笔记。")
+                post["her_notes"] = existing + [{"text": text, "at": str(item.get("at") or "")[:40]}]
         for provenance_key, limit in (("source_tool", 32), ("grow_batch_id", 64), ("last_merged_by", 32)):
             if provenance_key in kwargs:
                 value = str(kwargs[provenance_key] or "").strip()[:limit]
@@ -2288,7 +2304,8 @@ class BucketManager:
         name_raw = fuzz.partial_ratio(query, meta.get("name", "") or "")
         summary_raw = fuzz.partial_ratio(query, meta.get("summary", "") or "")
         meaning_raw = max(
-            (fuzz.partial_ratio(query, value) for value in self._normalize_meaning_list(meta.get("meaning") or [])),
+            (fuzz.partial_ratio(query, value)
+             for value in self._normalize_meaning_list(meta.get("meaning") or []) + self._her_note_texts(meta)),
             default=0,
         )
         why_raw = fuzz.partial_ratio(query, meta.get("why_remembered", "") or "")

@@ -1124,6 +1124,33 @@ def _review_candidates(all_buckets: list, today=None, limit: int = 30) -> list:
     return rows[:limit]
 
 
+_HER_NOTE_PREFIX_RE = re.compile(r"^她的笔记\s*(?:[（(]\s*(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*[)）])?\s*[:：]\s*")
+
+
+def _her_notes_of(meta: dict) -> list:
+    """她的笔记: 元数据 her_notes + meaning 里以"她的笔记："/"她的笔记（2026-09-30）："开头的, 按时间排(没日期的在前)。"""
+    out = []
+    for m in (meta or {}).get("meaning") or []:
+        text = str(m or "").strip()
+        hit = _HER_NOTE_PREFIX_RE.match(text)
+        if hit and text[hit.end():].strip():
+            at = f"{hit.group(1)}-{int(hit.group(2)):02d}-{int(hit.group(3)):02d}" if hit.group(1) else ""
+            out.append({"text": text[hit.end():].strip(), "at": at, "from_meaning": True})
+    for n in (meta or {}).get("her_notes") or []:
+        if isinstance(n, dict) and str(n.get("text") or "").strip():
+            out.append({"text": str(n["text"]), "at": str(n.get("at") or "")})
+    out.sort(key=lambda n: n["at"])
+    return out
+
+
+def _her_notes_block(meta: dict) -> str:
+    """breath / breath_search 返回这条记忆时一并带出她写的笔记 —— 她写就是为了让他看见。"""
+    notes = _her_notes_of(meta)
+    if not notes:
+        return ""
+    return "\n[她的笔记]\n" + "\n".join(f"- {('(' + n['at'][:10] + ') ') if n['at'] else ''}{n['text']}" for n in notes)
+
+
 def _note_row(b: dict) -> dict:
     """知识本条目的统一视图(页面与 breath 通道共用)。主题取第一个领域。"""
     meta = b.get("metadata") or {}
@@ -1140,12 +1167,137 @@ def _note_row(b: dict) -> dict:
         "id": b["id"],
         "title": meta.get("name") or strip_wikilinks(str(b.get("content") or ""))[:20],
         "content": strip_wikilinks(str(b.get("content") or "")),
+        "preview": _parse_note_body(strip_wikilinks(str(b.get("content") or "")))["about"][:400],
         "topic": domains[0] if domains else "其他",
         "tags": tags[:6],
         "day": day.isoformat() if day else "",
         "cities": cities,
         "mine": meta.get("created_by") == "user",
         "pinned": bool(is_highlighted(meta)),
+    }
+
+
+# --- 知识本详情页 ---
+_NOTE_HIDDEN_TAGS = {"handbook", "知识", "讲解"}
+_JOURNEY_TAG_RE = re.compile(r"^[a-z]+[-_]?\d{4}$", re.I)   # italy2026 这类旅程标签
+_NOTE_URL_RE = re.compile(r"https?://[^\s，。、；）)\]】>\"'<]+")
+# 「类别:名字」标签 → 相关页卡片上的"为什么相关"
+_NOTE_KIND_REASON = {
+    "城市": "同一座城市", "国家": "同一个国家", "地区": "同一个地区", "地点": "同一个地方", "景点": "同一个地方",
+    "画家": "同一位画家", "艺术家": "同一位艺术家", "雕塑家": "同一位雕塑家", "建筑师": "同一位建筑师",
+    "作者": "同一位作者", "作家": "同一位作家", "人物": "同一个人", "时期": "同一个时期", "时代": "同一个时代",
+    "世纪": "同一个世纪", "流派": "同一个流派", "风格": "同一种风格", "博物馆": "同一座博物馆",
+    "美术馆": "同一座美术馆", "教堂": "同一座教堂", "主题": "同一个主题", "作品": "同一件作品",
+}
+
+
+_NOTE_REL_REASON = {"related_to": "记忆里连着", "same_event": "同一件事", "caused_by": "前因后果",
+                    "causes": "前因后果", "continuation_of": "前后接着", "continues": "前后接着"}
+
+
+def _split_note_tag(tag: str):
+    """「城市:罗马」/「城市：罗马」→ ("城市", "罗马"); 普通标签 → None。"""
+    m = re.match(r"^\s*([^:：]{1,12})\s*[:：]\s*(.+?)\s*$", str(tag or ""))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _note_tag_visible(tag: str) -> bool:
+    t = str(tag or "").strip()
+    return bool(t) and not t.startswith("__") and t.lower() not in _NOTE_HIDDEN_TAGS and not _JOURNEY_TAG_RE.match(t)
+
+
+def _note_kind_tags(meta: dict) -> set:
+    return {kt for t in (meta.get("tags") or []) if _note_tag_visible(t) and (kt := _split_note_tag(t))}
+
+
+def _parse_note_body(content: str) -> dict:
+    """把知识条目正文拆成 关于 / 叩问(问答) / 来源, 叩问和来源不再留在「关于」里。"""
+    lines = str(content or "").replace("\r\n", "\n").split("\n")
+    source = None
+    for i in range(len(lines) - 1, -1, -1):   # 正文最后一行以"来源："开头的
+        if not lines[i].strip():
+            continue
+        if re.match(r"^\s*来源\s*[:：]", lines[i]):
+            text = re.sub(r"^\s*来源\s*[:：]\s*", "", lines[i])
+            source = {"text": text, "urls": _NOTE_URL_RE.findall(text)}
+            lines = lines[:i]
+        break
+    qa, about = [], lines
+    head = next((i for i, l in enumerate(lines) if re.sub(r"[#【】\[\]*\s:：]", "", l) == "叩问"), None)
+    if head is not None:
+        about, rest = lines[:head], []
+        cur = None
+        for l in lines[head + 1:]:
+            m = re.match(r"^\s*(问|答)\s*[:：]\s*(.*)$", l)
+            if m and m.group(1) == "问":
+                cur = {"q": m.group(2).strip(), "a": ""}
+                qa.append(cur)
+            elif m and cur is not None:
+                cur["a"] = (cur["a"] + "\n" + m.group(2)).strip()
+            elif cur is not None and l.strip():   # 多行回答/问题的续行
+                key = "a" if cur["a"] else "q"
+                cur[key] = (cur[key] + "\n" + l.strip()).strip()
+            else:
+                rest.append(l)
+        about = about + rest   # 叩问下面不是问答格式的零散文字, 留回「关于」
+    return {"about": "\n".join(about).strip(), "qa": qa, "source": source}
+
+
+def _note_related(bucket: dict, knowledge: list) -> list:
+    """「翻到相关的页」: 记忆关系里也是知识的(双向) + 共享任意「类别:名字」标签的知识条目, 合并去重。"""
+    meta = bucket.get("metadata") or {}
+    me, mine = bucket["id"], _note_kind_tags(meta)
+    by_id = {b["id"]: b for b in knowledge}
+    found: dict = {}
+
+    def add(bid, reason, rank):
+        if bid == me or bid not in by_id:
+            return
+        row = found.setdefault(bid, {"reasons": [], "rank": 0})
+        if reason not in row["reasons"]:
+            row["reasons"].append(reason)
+        row["rank"] += rank
+
+    def why(rel):   # 方向无关的说法, 反向那头读起来也通
+        if rel["type"] == "custom":
+            return rel["label"] or "记忆里连着"
+        return _NOTE_REL_REASON.get(rel["type"], "记忆里连着")
+
+    for rel in _relations_for_api(meta):
+        add(rel["target"], why(rel), 3)
+    for b in knowledge:
+        for rel in _relations_for_api(b.get("metadata") or {}):
+            if rel["target"] == me:
+                add(b["id"], why(rel), 3)
+        for kind, name in sorted(mine & _note_kind_tags(b.get("metadata") or {})):
+            add(b["id"], f"{_NOTE_KIND_REASON.get(kind, '同一个' + kind)} · {name}", 1)
+    out = []
+    for bid, row in found.items():
+        n = _note_row(by_id[bid])
+        out.append({"id": bid, "title": n["title"], "topic": n["topic"], "day": n["day"],
+                    "snippet": n["preview"][:80], "reasons": row["reasons"],
+                    "_rank": row["rank"]})
+    out.sort(key=lambda r: r["day"], reverse=True)
+    out.sort(key=lambda r: -r["_rank"])   # 关系越多越靠前, 同分新的在前
+    for r in out:
+        r.pop("_rank")
+    return out[:12]
+
+
+def _note_detail(bucket: dict, knowledge: list) -> dict:
+    meta = bucket.get("metadata") or {}
+    row = _note_row(bucket)
+    # 只显示「类别:名字」胶囊; 普通标签多是系统自动打的, 不显示
+    kinds = [{"kind": kt[0], "name": kt[1]} for t in meta.get("tags") or []
+             if _note_tag_visible(t) and (kt := _split_note_tag(t))]
+    cities = list(dict.fromkeys(row["cities"] + [k["name"] for k in kinds if k["kind"] == "城市"]))
+    his = [t for m in meta.get("meaning") or [] if (t := str(m or "").strip()) and not _HER_NOTE_PREFIX_RE.match(t)]
+    return {
+        "id": row["id"], "title": row["title"], "topic": row["topic"], "day": row["day"],
+        "cities": cities, "kind_tags": kinds, "mine": row["mine"],
+        **_parse_note_body(row["content"]),
+        "his_notes": his, "her_notes": _her_notes_of(meta),
+        "related": _note_related(bucket, knowledge),
     }
 
 
@@ -1405,7 +1557,7 @@ async def _breath_impl(
         except Exception as e:
             logger.error(f"Knowledge retrieval failed: {e}")
             return "读取知识本失败。"
-        notes = [_note_row(b) for b in all_buckets
+        notes = [{**_note_row(b), "her": _her_notes_block(b.get("metadata") or {})} for b in all_buckets
                  if is_knowledge(b.get("metadata") or {}) and (b.get("metadata") or {}).get("type") != "trashed"
                  and _bucket_in_date_range(b.get("metadata") or {}, date_lo, date_hi)]
         if not notes:
@@ -1418,7 +1570,7 @@ async def _breath_impl(
             lines.append(f"\n【{topic}】")
             for n in sorted(by_topic[topic], key=lambda x: x["day"], reverse=True):
                 where = f"（{'、'.join(n['cities'])}）" if n["cities"] else ""
-                entry = f"· {n['title']}{where} [bucket_id:{n['id']}]\n  {n['content']}"
+                entry = f"· {n['title']}{where} [bucket_id:{n['id']}]\n  {n['content']}{n['her']}"
                 used += count_tokens_approx(entry)
                 if used > max_tokens:
                     lines.append("…（后面还有，按关键词用 breath_search 找）")
@@ -1480,7 +1632,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(_with_hint(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
+                pinned_results.append(_with_hint(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}{_her_notes_block(b['metadata'])}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
                 continue
@@ -1504,7 +1656,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                protected_results.append(_with_hint(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}", b, _visible_ids))
+                protected_results.append(_with_hint(f"❖ [永久参考] [bucket_id:{b['id']}] {summary}{_her_notes_block(b['metadata'])}", b, _visible_ids))
             except Exception as e:
                 logger.warning(f"Failed to dehydrate protected bucket / 钉决桶脱水失败: {e}")
                 continue
@@ -1599,6 +1751,7 @@ async def _breath_impl(
             try:
                 clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                 summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
+                summary += _her_notes_block(b["metadata"])
                 summary_tokens = count_tokens_approx(summary)
                 if summary_tokens > token_budget:
                     break
@@ -1780,6 +1933,7 @@ async def _breath_impl(
         for bucket, summary in zip(wave, summaries):
             if summary is None:
                 continue
+            summary += _her_notes_block(bucket.get("metadata"))
             summary_tokens = count_tokens_approx(summary)
             if token_used + summary_tokens > max_tokens:
                 budget_hit = True
@@ -1823,7 +1977,7 @@ async def _breath_impl(
                 for b in drifted:
                     clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
                     summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                    drift_results.append(f"[surface_type: random]\n{summary}")
+                    drift_results.append(f"[surface_type: random]\n{summary}{_her_notes_block(b['metadata'])}")
                 results.append("--- 忽然想起来 ---\n" + "\n---\n".join(drift_results))
         except Exception as e:
             logger.warning(f"Random surfacing failed / 随机浮现失败: {e}")
@@ -3930,6 +4084,50 @@ async def api_notes(request):
     _schedule_place_extraction(bucket_id, content, [topic or "知识"])
     _invalidate_buckets_cache()
     return JSONResponse({"ok": True, "note": _note_row(await bucket_mgr.get(bucket_id))})
+
+
+def _is_live_knowledge(b: dict | None) -> bool:
+    meta = (b or {}).get("metadata") or {}
+    return bool(b) and is_knowledge(meta) and meta.get("type") != "trashed"
+
+
+@mcp.custom_route("/api/notes/{note_id}", methods=["GET"])
+async def api_note_detail(request):
+    """知识本详情页: 拆好的 关于/叩问/来源、两个人的笔记、相关的页。"""
+    from starlette.responses import JSONResponse
+    bucket = await bucket_mgr.get(request.path_params["note_id"])
+    if not _is_live_knowledge(bucket):
+        return JSONResponse({"ok": False, "error": "这一页找不到了"}, status_code=404)
+    knowledge = [b for b in await bucket_mgr.list_all(include_archive=False) if _is_live_knowledge(b)]
+    return JSONResponse({"ok": True, "note": _note_detail(bucket, knowledge)})
+
+
+@mcp.custom_route("/api/notes/{note_id}/her-note", methods=["POST"])
+async def api_note_her_note(request):
+    """POST {text} —— 她在详情页夹进一条笔记, 追加到元数据 her_notes [{text, at}]。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    note_id = request.path_params["note_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        return JSONResponse({"ok": False, "error": "笔记还空着"}, status_code=400)
+    if len(text) > 2000:
+        return JSONResponse({"ok": False, "error": "一条笔记最多 2000 字"}, status_code=400)
+    if not _is_live_knowledge(await bucket_mgr.get(note_id)):
+        return JSONResponse({"ok": False, "error": "这一页找不到了"}, status_code=404)
+    at = _dt.utcnow().isoformat(timespec="seconds") + "Z"
+    try:
+        await bucket_mgr.update(note_id, her_notes_append={"text": text, "at": at})
+    except ValueError as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+    _invalidate_buckets_cache()
+    meta = (await bucket_mgr.get(note_id))["metadata"]
+    return JSONResponse({"ok": True, "note": {"text": text, "at": at},
+                         "count": len(meta.get("her_notes") or [])})
 
 
 # --- 「关于你」档案(本 fork 新增) ---

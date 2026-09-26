@@ -370,6 +370,97 @@ async def test_notes_api_create_and_list(srv):
     assert [n["title"] for n in listed["notes"]] == ["焦虑三步"] and listed["topics"] == [["身心", 1]]
 
 
+class _NoteReq:
+    def __init__(self, note_id, body=None):
+        self.path_params, self._b, self.query_params, self.method = {"note_id": note_id}, body, {}, "POST"
+
+    async def json(self):
+        return self._b
+
+
+def test_parse_note_body_splits_about_qa_source():
+    body = ("卡拉瓦乔用强烈明暗对比。\n他在罗马画了很多教堂祭坛画。\n\n叩问\n问：为什么光从左上来？\n答：模拟窗户，\n也像神的召唤。\n"
+            "问：他为什么逃离罗马？\n答：杀了人。\n\n来源：维基 https://zh.wikipedia.org/wiki/卡拉瓦乔 和 https://example.com/a")
+    p = server_mod().__dict__["_parse_note_body"](body)
+    assert p["about"] == "卡拉瓦乔用强烈明暗对比。\n他在罗马画了很多教堂祭坛画。"
+    assert p["qa"] == [{"q": "为什么光从左上来？", "a": "模拟窗户，\n也像神的召唤。"}, {"q": "他为什么逃离罗马？", "a": "杀了人。"}]
+    assert p["source"]["urls"] == ["https://zh.wikipedia.org/wiki/卡拉瓦乔", "https://example.com/a"]
+    plain = server_mod()._parse_note_body("只有正文\n来源不在行首：x")
+    assert plain == {"about": "只有正文\n来源不在行首：x", "qa": [], "source": None}
+
+
+def server_mod():
+    import server
+    return server
+
+
+@pytest.mark.asyncio
+async def test_note_detail_tags_notes_and_related(srv):
+    server, bm = srv
+    tags = ["handbook", "知识", "讲解", "italy2026", "城市:罗马", "画家：卡拉瓦乔", "巴洛克"]
+    a = await bm.create(content="《圣马太蒙召》\n来源：https://a.example/x", name="圣马太蒙召", tags=tags, domain=["艺术"])
+    b = await bm.create(content="卡拉瓦乔另一幅", name="以马忤斯的晚餐", tags=["handbook", "画家:卡拉瓦乔", "城市:伦敦"], domain=["艺术"])
+    c = await bm.create(content="罗马的喷泉", name="特雷维", tags=["handbook", "城市:罗马"], domain=["出行"])
+    d = await bm.create(content="被关系连上的知识", name="连着的", tags=["handbook"], domain=["艺术"])
+    await bm.create(content="普通记忆也有罗马", name="普通", tags=["城市:罗马"])
+    await bm.update(a, meaning=["光是救赎的隐喻", "她的笔记：想去圣王路易堂看原作"])
+    import frontmatter
+    path = bm._find_bucket_file(d)   # 关系只记在 d 那头, 检验反向也能翻到
+    post = frontmatter.load(path)
+    post["relation_links"] = [{"target_bucket_id": a, "type": "related_to", "status": "active"}]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
+    bm._invalidate_active_cache()
+    resp = await server.api_note_detail(_NoteReq(a))
+    note = json.loads(resp.body)["note"]
+    assert note["kind_tags"] == [{"kind": "城市", "name": "罗马"}, {"kind": "画家", "name": "卡拉瓦乔"}]
+    assert "tags" not in note and "罗马" in note["cities"]   # 普通标签(巴洛克)不显示
+    assert note["his_notes"] == ["光是救赎的隐喻"]
+    assert [n["text"] for n in note["her_notes"]] == ["想去圣王路易堂看原作"]
+    assert note["source"]["urls"] == ["https://a.example/x"] and "来源" not in note["about"]
+    rel = {r["id"]: r["reasons"] for r in note["related"]}
+    assert set(rel) == {b, c, d}   # 普通记忆不算
+    assert rel[b] == ["同一位画家 · 卡拉瓦乔"] and rel[c] == ["同一座城市 · 罗马"] and rel[d] == ["记忆里连着"]
+    assert (await server.api_note_detail(_NoteReq("nope"))).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_her_note_appends_to_metadata(srv):
+    server, bm = srv
+    k = await bm.create(content="德国火车验票", name="验票", tags=["handbook"], domain=["出行"])
+    n = await bm.create(content="拉面", name="拉面")
+    assert (await server.api_note_her_note(_NoteReq(k, {"text": "  "}))).status_code == 400
+    assert (await server.api_note_her_note(_NoteReq(n, {"text": "x"}))).status_code == 404   # 不是知识
+    ok = json.loads((await server.api_note_her_note(_NoteReq(k, {"text": "慕尼黑也要打卡"}))).body)
+    await server.api_note_her_note(_NoteReq(k, {"text": "第二条"}))
+    hn = (await bm.get(k))["metadata"]["her_notes"]
+    assert ok["ok"] and [x["text"] for x in hn] == ["慕尼黑也要打卡", "第二条"] and hn[0]["at"].endswith("Z")
+    detail = json.loads((await server.api_note_detail(_NoteReq(k))).body)["note"]
+    assert [x["text"] for x in detail["her_notes"]] == ["慕尼黑也要打卡", "第二条"]
+
+
+@pytest.mark.asyncio
+async def test_her_notes_dated_sorted_and_visible_to_him(srv):
+    server, bm = srv
+    k = await bm.create(content="卡拉瓦乔用强光打在人物脸上。\n\n叩问\n问：为什么？\n答：戏剧性。\n来源：https://x.example",
+                        name="明暗", tags=["handbook"], domain=["艺术"])
+    await bm.update(k, meaning=["他的一句话", "她的笔记（2026-09-30）：原作比画册暗很多", "她的笔记：没写日期的一条"])
+    await bm.update(k, her_notes_append={"text": "博尔盖塞要提前订票", "at": "2026-09-28T10:00:00Z"})
+    await bm.update(k, her_notes_append={"text": "十月再去一次", "at": "2026-10-02T09:00:00Z"})
+    hers = server._her_notes_of((await bm.get(k))["metadata"])
+    assert [(n["text"], n["at"][:10]) for n in hers] == [
+        ("没写日期的一条", ""), ("博尔盖塞要提前订票", "2026-09-28"),
+        ("原作比画册暗很多", "2026-09-30"), ("十月再去一次", "2026-10-02")]
+    # 列表卡片只预览「关于」
+    row = server._note_row(await bm.get(k))
+    assert row["preview"] == "卡拉瓦乔用强光打在人物脸上。"
+    # 她的笔记进检索, 且 breath_search 返回时一并带出
+    out = await server.breath_search(query="博尔盖塞")
+    assert k in out and "[她的笔记]" in out and "- (2026-09-28) 博尔盖塞要提前订票" in out and "(2026-09-30) 原作比画册暗很多" in out
+    chan = await server.breath_advanced(domain="知识")
+    assert "[她的笔记]" in chan and "十月再去一次" in chan
+
+
 @pytest.mark.asyncio
 async def test_places_merge_city_into_tags(srv):
     server, bm = srv
