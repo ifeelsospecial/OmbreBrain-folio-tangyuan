@@ -779,3 +779,43 @@ def now_iso() -> str:
     JST 用户前端看时间偏移 9 小时,改成显式标 UTC 让前端能正确转换。
     """
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+# ============================================================
+# 批量 AI 任务的额度保险丝（本 fork 新增）
+# 免费档 Gemini 撞到额度会回 429。以前每条出错只记一下就接着跑，
+# 额度一旦用完，剩下几十条会全部白跑、白白报错(地点回填甚至悄悄吞掉、显示 0 错误)。
+# 现在: 撞 429 先歇一会儿(可能只是每分钟太快); 连续 stop_after 次仍是 429 → 判定今天额度用完, 提前停下。
+# ============================================================
+def is_quota_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return ("429" in text or "quota" in text or "resource_exhausted" in text
+            or "ratelimit" in text or "rate limit" in text)
+
+
+class QuotaGuard:
+    """用法: 成功后 ok(); 出错后 `if await guard.failed(exc): break`。停下时写 progress["stopped"]。"""
+
+    def __init__(self, progress: dict, stop_after: int = 3, cooldown_s: float = 60.0):
+        self.progress = progress
+        self.stop_after = stop_after
+        self.cooldown_s = cooldown_s
+        self.streak = 0
+        progress["stopped"] = ""
+
+    def ok(self) -> None:
+        self.streak = 0
+
+    async def failed(self, exc: BaseException) -> bool:
+        if not is_quota_error(exc):
+            self.streak = 0
+            return False
+        self.streak += 1
+        if self.streak >= self.stop_after:
+            self.progress["stopped"] = (
+                f"AI 额度用完了(连续 {self.streak} 次 429)，已提前停下；"
+                "没处理到的不受影响，额度重置后(英国早上 8 点)再跑一次即可")
+            return True
+        if self.cooldown_s:
+            await asyncio.sleep(self.cooldown_s)
+        return False

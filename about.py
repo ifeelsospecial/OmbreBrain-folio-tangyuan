@@ -278,14 +278,21 @@ async def draft_from_memories(bucket_mgr, dehydrator, store: AboutStore, progres
     batches = [lines[i:i + DRAFT_BATCH] for i in range(0, len(lines), DRAFT_BATCH)]
     progress["batches"] = len(batches) + 1
     pooled = {k: [] for k in ASPECT_KEYS}
+    from utils import QuotaGuard
+    guard = QuotaGuard(progress)
     for chunk in batches:
         try:
             got = await _ask_json(dehydrator, _DRAFT_PROMPT, "\n".join(chunk))
             for k in ASPECT_KEYS:
                 pooled[k].extend(got[k])
+            guard.ok()
         except Exception as exc:  # noqa: BLE001
             progress["errors"] += 1
             progress["last_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            if await guard.failed(exc):
+                progress["last_error"] = progress["stopped"]
+                progress["running"] = False
+                return progress
         progress["done_batches"] += 1
         if pause_s:
             await asyncio.sleep(pause_s)

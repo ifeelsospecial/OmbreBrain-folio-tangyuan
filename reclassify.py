@@ -41,6 +41,8 @@ async def reclassify_uncategorized(bucket_mgr, dehydrator, progress: dict, pause
     if limit and limit > 0:
         buckets = buckets[:limit]
     progress["total"] = len(buckets)
+    from utils import QuotaGuard
+    guard = QuotaGuard(progress)
 
     for bucket in buckets:
         bid = bucket["id"]
@@ -65,10 +67,15 @@ async def reclassify_uncategorized(bucket_mgr, dehydrator, progress: dict, pause
                     progress["changed"] += 1
                 else:
                     progress["skipped"] += 1
+            guard.ok()
         except Exception as exc:  # noqa: BLE001
             progress["errors"] += 1
             progress["last_error"] = f"{bid}: {type(exc).__name__}: {exc}"[:300]
             logger.warning(f"reclassify failed / 重新分类失败 {bid}: {exc}")
+            progress["processed"] += 1
+            if await guard.failed(exc):
+                break
+            continue
         progress["processed"] += 1
         if pause_s:
             await asyncio.sleep(pause_s)
