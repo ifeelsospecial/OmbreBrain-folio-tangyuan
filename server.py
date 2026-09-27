@@ -117,10 +117,13 @@ def _invalidate_buckets_cache():
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
+# stateless_http: 每次调用自成一体, 不在内存里存会话。否则每次重启/部署都会清掉会话,
+# 已经打开的 claude.ai 对话拿着旧 Mcp-Session-Id 只会收到 404 "Session not found", 再也接不回来。
 mcp = FastMCP(
     "Ombre Brain",
     host="0.0.0.0",
     port=SERVER_PORT,
+    stateless_http=True,
 )
 
 
