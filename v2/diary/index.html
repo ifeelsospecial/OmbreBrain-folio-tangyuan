@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<script src="../auth-token.js"></script>
+<script src="../theme-system.compiled.js"></script>
+<script src="../island-ui.js"></script>
+<title>日记</title>
+<link rel="icon" type="image/svg+xml" href="/v2/favicon.svg" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,500;1,400;1,500&family=Noto+Serif+SC:wght@400;600&display=swap" />
+<link rel="stylesheet" href="../island-ui.css" />
+<style>
+  .head { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; flex-wrap: wrap; margin-bottom: 30px; }
+  .count { font: italic 500 46px/1 var(--serif-en); color: var(--pg-accent); text-align: right; }
+  .count small { display: block; font: 12px var(--sans); font-style: normal; color: var(--pg-soft); letter-spacing: .08em; margin-top: 4px; }
+
+  .day { margin: 0 0 44px; animation: rise .45s both cubic-bezier(.2,.8,.2,1); }
+  @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
+  .day-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+  .day-head .d { font: italic 500 40px/1 var(--serif-en); color: var(--pg-accent); }
+  .day-head .my { font: 600 11px var(--sans); letter-spacing: .18em; color: var(--pg-soft); }
+  .day-head .wd { font: 13px var(--serif-cn); color: var(--pg-faint); }
+  .day-head::after { content: ""; flex: 1; height: 1px; background: var(--pg-line); transform: translateY(-8px); }
+
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+  .pair.solo { grid-template-columns: minmax(0, 720px); }
+  .col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+  @media (max-width: 720px) { .pair { grid-template-columns: 1fr; } }
+
+  .entry { padding: 20px 22px 16px; border-radius: var(--pg-radius); border: 1px solid var(--pg-line); box-shadow: var(--pg-shadow); position: relative; }
+  .entry.his { background: color-mix(in srgb, var(--pg-warm) 14%, var(--pg-paper)); border-color: color-mix(in srgb, var(--pg-warm) 24%, transparent); }
+  .entry.hers { background: var(--pg-paper); }
+  .who { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; font: 600 12px var(--sans); letter-spacing: .12em; }
+  .who .dot { width: 8px; height: 8px; border-radius: 50%; }
+  .his .who { color: color-mix(in srgb, var(--pg-warm) 85%, var(--pg-ink)); } .his .who .dot { background: var(--pg-warm); }
+  .hers .who { color: var(--pg-accent); } .hers .who .dot { background: var(--pg-accent); }
+  .who .en { margin-left: auto; font: italic 400 15px var(--serif-en); letter-spacing: 0; color: var(--pg-faint); }
+  .body { font-size: 16px; line-height: 1.95; white-space: pre-wrap; word-break: break-word; }
+
+  .comments { margin-top: 16px; padding-top: 12px; border-top: 1px dashed var(--pg-line); display: flex; flex-direction: column; gap: 8px; }
+  .cm { font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+  .cm b { font: 600 12px var(--sans); margin-right: 6px; }
+  .cm.his b { color: color-mix(in srgb, var(--pg-warm) 85%, var(--pg-ink)); }
+  .cm.hers b { color: var(--pg-accent); }
+  .cm time { font: 11.5px var(--sans); color: var(--pg-faint); margin-left: 6px; }
+  .reply { display: flex; gap: 8px; margin-top: 4px; }
+  .reply .field { padding: 8px 12px; font-size: 14px; border-radius: 999px; min-width: 0; }
+  .reply .btn { min-height: 38px; padding: 0 14px; font-size: 13px; border-radius: 999px; flex: none; }
+
+  .fab { position: fixed; right: calc(20px + env(safe-area-inset-right)); bottom: calc(22px + env(safe-area-inset-bottom)); z-index: 20;
+    border-radius: 999px; padding: 0 22px; min-height: 52px; box-shadow: 0 10px 30px color-mix(in srgb, var(--pg-accent) 35%, transparent); }
+  .form label { display: block; font: 600 12px var(--sans); letter-spacing: .1em; color: var(--pg-soft); margin: 16px 0 7px; }
+  .form textarea { min-height: 220px; resize: vertical; line-height: 1.9; }
+  .form input[type=date] { font-family: var(--sans); max-width: 220px; }
+  .form .submit { margin-top: 22px; width: 100%; }
+  .form .err { color: #c0605a; font: 13px var(--sans); margin-top: 10px; min-height: 1em; }
+</style>
+</head>
+<body>
+<main class="pg">
+  <div id="top"></div>
+  <header class="head">
+    <div>
+      <p class="pg-eyebrow">Diary</p>
+      <h1 class="pg-title">日记</h1>
+      <p class="pg-sub">Two pens, one day.</p>
+    </div>
+    <div class="count" id="count" hidden></div>
+  </header>
+  <section id="days" aria-live="polite"></section>
+</main>
+<button class="btn primary fab" id="add">＋ 写日记</button>
+
+<div class="sheet-wrap" id="form-wrap" aria-hidden="true">
+  <form class="sheet form" id="form" role="dialog" aria-modal="true" aria-label="写日记">
+    <div class="sheet-grip"></div>
+    <p class="pg-eyebrow">Dear diary</p>
+    <h2 class="pg-title" style="font-size:22px">写日记</h2>
+    <label for="f-date">日期</label>
+    <input class="field" id="f-date" type="date" required />
+    <label for="f-content">今天</label>
+    <textarea class="field" id="f-content" placeholder="今天发生了什么，想记住什么……" required></textarea>
+    <div class="err" id="f-err"></div>
+    <button class="btn primary submit" type="submit" id="f-submit">写进这一天</button>
+  </form>
+</div>
+
+<script>
+(function () {
+  const { esc, api, toast, fmtDay } = window.PG;
+  document.getElementById('top').innerHTML = PG.topbar('diary');
+  const box = document.getElementById('days');
+  const NAMES = { his: '祁煜', hers: '汤圆' }, EN = { his: 'his', hers: 'hers' };
+  const WD = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+  let days = [];
+
+  const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+  const weekday = iso => { const [y, m, d] = iso.split('-').map(Number); return y ? WD[new Date(y, m - 1, d).getDay()] : ''; };
+  const short = at => at ? at.slice(5, 10).replace('-', '/') : '';
+
+  const commentHtml = c => `<div class="cm ${c.side}"><b>${esc(NAMES[c.side])}</b>${esc(c.text)}${c.at ? `<time>${esc(short(c.at))}</time>` : ''}</div>`;
+
+  function entryHtml(e, side) {
+    return `<article class="entry ${side}" data-id="${esc(e.id)}">
+      <div class="who"><span class="dot"></span>${NAMES[side]}<span class="en">${EN[side]}</span></div>
+      <div class="body">${esc(e.content)}</div>
+      <div class="comments"><div class="cms">${e.comments.map(commentHtml).join('')}</div>
+        <form class="reply"><input class="field" maxlength="2000" placeholder="留一句……" aria-label="留言" /><button class="btn" type="submit">留言</button></form>
+      </div></article>`;
+  }
+
+  function render() {
+    const c = document.getElementById('count');
+    const n = days.reduce((s, d) => s + d.his.length + d.hers.length, 0);
+    c.hidden = !n;
+    c.innerHTML = `${n}<small>篇 · ${days.length} 天</small>`;
+    if (!days.length) {
+      box.innerHTML = `<div class="empty"><svg viewBox="0 0 120 60" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M38 8h40a4 4 0 0 1 4 4v40H42a4 4 0 0 1-4-4Z"/><path d="M48 22h24M48 30h24M48 38h14"/></svg>
+        <div class="big">还没有日记</div><div>点右下角写下第一篇。<br>他写的日记也会出现在这里。</div></div>`;
+      return;
+    }
+    box.innerHTML = days.map((d, i) => {
+      const f = fmtDay(d.date);
+      const both = d.his.length && d.hers.length;
+      const col = side => d[side].length ? `<div class="col">${d[side].map(e => entryHtml(e, side)).join('')}</div>` : '';
+      return `<section class="day" style="animation-delay:${Math.min(i, 8) * 40}ms">
+        <div class="day-head"><span class="d">${esc(f.d)}</span><span class="my">${esc(f.m)} ${esc(f.y)}</span><span class="wd">${esc(weekday(d.date))}</span></div>
+        <div class="pair${both ? '' : ' solo'}">${col('his')}${col('hers')}</div></section>`;
+    }).join('');
+    box.querySelectorAll('.reply').forEach(form => form.onsubmit = async ev => {
+      ev.preventDefault();
+      const input = form.querySelector('input'), btn = form.querySelector('button');
+      const text = input.value.trim();
+      if (!text) return input.focus();
+      const id = form.closest('.entry').dataset.id;
+      btn.disabled = true;
+      try {
+        const res = await api(`/api/letters/${encodeURIComponent(id)}/comments`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
+        form.parentElement.querySelector('.cms').insertAdjacentHTML('beforeend', commentHtml(res.comment));
+        for (const d of days) for (const e of [...d.his, ...d.hers]) if (e.id === id) e.comments.push(res.comment);
+        input.value = '';
+      } catch (err) { toast('没留上：' + err.message); }
+      finally { btn.disabled = false; }
+    });
+  }
+
+  function sheet(open) {
+    const w = document.getElementById('form-wrap');
+    w.classList.toggle('open', open);
+    w.setAttribute('aria-hidden', String(!open));
+  }
+  document.getElementById('form-wrap').addEventListener('click', e => { if (e.target.id === 'form-wrap') sheet(false); });
+  document.addEventListener('keydown', e => { if (e.key === 'Escape') sheet(false); });
+  document.getElementById('add').onclick = () => {
+    document.getElementById('f-date').value = today();
+    document.getElementById('f-err').textContent = '';
+    sheet(true);
+    setTimeout(() => document.getElementById('f-content').focus(), 250);
+  };
+  document.getElementById('form').onsubmit = async e => {
+    e.preventDefault();
+    const date = document.getElementById('f-date').value || today();
+    const content = document.getElementById('f-content').value.trim();
+    if (!content) { document.getElementById('f-err').textContent = '还没写呢。'; return; }
+    const btn = document.getElementById('f-submit');
+    btn.disabled = true;
+    try {
+      await api('/api/letters', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ author: 'user', content, date, title: `日记 · ${date}` }) });
+      document.getElementById('form').reset();
+      sheet(false);
+      await load();
+      toast('写好了 · 他也能读到');
+    } catch (err) {
+      document.getElementById('f-err').textContent = '没存上：' + err.message;
+    } finally { btn.disabled = false; }
+  };
+
+  async function load() {
+    try {
+      days = (await api('/api/diary')).days || [];
+      render();
+    } catch (e) {
+      box.innerHTML = `<div class="empty"><div class="big">没能读到日记</div><div>${esc(e.message)} · 刷新一下试试</div></div>`;
+    }
+  }
+  box.innerHTML = '<div class="empty">正在翻开……</div>';
+  load();
+})();
+</script>
+</body>
+</html>

@@ -3088,6 +3088,20 @@ def _ai_name() -> str:
     return os.environ.get("AI_NAME", "AI").strip() or "AI"
 
 
+def _user_name() -> str:
+    """她的名字。信件里她写的有两种署名: 页面/API 存 "user", 他代存时按使用指南写她的名字。"""
+    return os.environ.get("USER_NAME", "汤圆").strip() or "汤圆"
+
+
+def _letter_author_aliases(author_filter: str) -> set:
+    normalized = _normalize_letter_author(author_filter)
+    if author_filter.lower() in ("ai", "claude"):
+        return {_ai_name(), "claude"}
+    if normalized in ("user", _user_name()):
+        return {"user", _user_name()}
+    return {normalized}
+
+
 def _normalize_letter_author(author: str, ai_name: str = "") -> str:
     raw = str(author or "").strip()
     ai = str(ai_name or "").strip() or _ai_name()
@@ -3096,6 +3110,71 @@ def _normalize_letter_author(author: str, ai_name: str = "") -> str:
     if raw.lower() in ("ai", "claude") or raw == ai:
         return ai
     return raw
+
+
+_DIARY_TITLE_RE = re.compile(r"^\s*日记\s*[·・•]")
+_ISO_DAY_RE = re.compile(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})")
+
+
+def _is_diary(meta: dict) -> bool:
+    """日记 = 标题以「日记 ·」/「日记·」开头的信件。"""
+    meta = meta or {}
+    return meta.get("type") == "letter" and bool(_DIARY_TITLE_RE.match(str(meta.get("title") or meta.get("name") or "")))
+
+
+def _letter_is_hers(meta: dict) -> bool:
+    """信件作者规范: 她写的存 "user"; 其余(AI_NAME / claude / AI)都算他。"""
+    author = str((meta or {}).get("author") or "").strip()
+    user_name = str((meta or {}).get("user_name") or "").strip()
+    return author in ("user", _user_name()) or bool(user_name and author == user_name)
+
+
+def _diary_day(meta: dict) -> str:
+    """日记属于哪一天: letter_date → 标题里的日期 → 创建日。"""
+    for raw in ((meta or {}).get("letter_date"), (meta or {}).get("title"), (meta or {}).get("name")):
+        m = _ISO_DAY_RE.search(str(raw or ""))
+        if m:
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    return str((meta or {}).get("created") or "")[:10]
+
+
+def _letter_comments(meta: dict) -> list:
+    out = []
+    for c in (meta or {}).get("comments") or []:
+        if isinstance(c, dict) and str(c.get("text") or "").strip():
+            author = str(c.get("author") or "")
+            out.append({"author": author, "side": "hers" if author == "user" else "his",
+                        "text": str(c["text"]), "at": str(c.get("at") or "")})
+    return out
+
+
+def _render_letter_comments(meta: dict) -> str:
+    comments = _letter_comments(meta)
+    if not comments:
+        return ""
+    return "\n[留言]\n" + "\n".join(
+        f"- {'她' if c['side'] == 'hers' else c['author']}{(' · ' + c['at'][:10]) if c['at'] else ''}：{c['text']}"
+        for c in comments)
+
+
+async def _add_letter_comment(letter_id: str, author: str, text: str) -> tuple:
+    """给一封信追加留言。返回 (comment, error)。"""
+    from datetime import datetime as _dt
+    text = str(text or "").strip()
+    if not text:
+        return None, "留言不能是空的。"
+    if len(text) > 2000:
+        return None, "一条留言最多 2000 字。"
+    bucket = await bucket_mgr.get(str(letter_id or "").strip())
+    if not bucket or (bucket.get("metadata") or {}).get("type") != "letter":
+        return None, "找不到这封信。"
+    comment = {"author": author, "text": text, "at": _dt.utcnow().isoformat(timespec="seconds") + "Z"}
+    try:
+        await bucket_mgr.update(bucket["id"], comments_append=comment)
+    except ValueError as e:
+        return None, str(e)
+    _invalidate_buckets_cache()
+    return {**comment, "side": "hers" if author == "user" else "his"}, ""
 
 
 @mcp.tool()
@@ -3159,8 +3238,7 @@ async def letter_read(
     ]
     author_filter = str(author or "").strip()
     if author_filter:
-        normalized = _normalize_letter_author(author_filter)
-        aliases = {_ai_name(), "claude"} if author_filter.lower() in ("ai", "claude") else {normalized}
+        aliases = _letter_author_aliases(author_filter)
         letters = [b for b in letters if b.get("metadata", {}).get("author") in aliases]
     def in_range(bucket):
         value = bucket.get("metadata", {}).get("letter_date") or bucket.get("metadata", {}).get("created", "")
@@ -3197,8 +3275,17 @@ async def letter_read(
         meta = bucket.get("metadata", {})
         stamp = (meta.get("letter_date") or meta.get("created", ""))[:10]
         title_text = meta.get("title") or meta.get("name", "")
-        parts.append(f"[{bucket['id']}] {meta.get('author', '?')} · {stamp}{(' · ' + title_text) if title_text else ''}\n{strip_wikilinks(bucket.get('content', ''))}")
+        parts.append(f"[{bucket['id']}] {meta.get('author', '?')} · {stamp}{(' · ' + title_text) if title_text else ''}\n{strip_wikilinks(bucket.get('content', ''))}{_render_letter_comments(meta)}")
     return "=== 信件 ===\n" + "\n\n---\n\n".join(parts)
+
+
+@mcp.tool()
+async def letter_comment(letter_id: str, text: str) -> str:
+    """给一封信/一篇日记留言（署你的名字）。她的日记在 letter_read 里能看到 [id]，读完想回应就留一句；留言会显示在日记页那篇下面。"""
+    comment, error = await _add_letter_comment(letter_id, _ai_name(), text)
+    if error:
+        return error
+    return f"💬 已留言 → {str(letter_id).strip()}"
 
 
 @mcp.tool()
@@ -4811,8 +4898,7 @@ async def api_letters(request):
     try:
         letters = [b for b in await bucket_mgr.list_all(include_archive=False) if b.get("metadata", {}).get("type") == "letter"]
         if author_filter:
-            normalized = _normalize_letter_author(author_filter)
-            aliases = {_ai_name(), "claude"} if author_filter.lower() in ("ai", "claude") else {normalized}
+            aliases = _letter_author_aliases(author_filter)
             letters = [b for b in letters if b.get("metadata", {}).get("author") in aliases]
         letters.sort(key=lambda b: b.get("metadata", {}).get("letter_date") or b.get("metadata", {}).get("created", ""), reverse=True)
         result = [{
@@ -4864,6 +4950,44 @@ async def api_letter_item(request):
         return JSONResponse({"error": "update failed"}, status_code=500)
     _invalidate_buckets_cache()
     return JSONResponse({"ok": True, "id": letter_id})
+
+
+@mcp.custom_route("/api/letters/{letter_id}/comments", methods=["POST"])
+async def api_letter_comments(request):
+    """POST {text, author?} —— 日记页留言; author 默认 user(她), 传 ai/claude/AI_NAME 记成他。"""
+    from starlette.responses import JSONResponse
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad json"}, status_code=400)
+    author = _normalize_letter_author((body or {}).get("author") or "user")
+    comment, error = await _add_letter_comment(request.path_params["letter_id"], author, (body or {}).get("text"))
+    if error:
+        return JSONResponse({"ok": False, "error": error}, status_code=404 if error == "找不到这封信。" else 400)
+    return JSONResponse({"ok": True, "comment": comment})
+
+
+@mcp.custom_route("/api/diary", methods=["GET"])
+async def api_diary(request):
+    """日记页: 标题以「日记 ·」开头的信件, 按天分组倒序, 每天分 his / hers 两边。"""
+    from starlette.responses import JSONResponse
+    days: dict = {}
+    for b in await bucket_mgr.list_all(include_archive=False):
+        meta = b.get("metadata") or {}
+        if not _is_diary(meta):
+            continue
+        side = "hers" if _letter_is_hers(meta) else "his"
+        day = _diary_day(meta)
+        days.setdefault(day, {"date": day, "his": [], "hers": []})[side].append({
+            "id": b["id"], "author": meta.get("author", ""), "title": meta.get("title") or meta.get("name", ""),
+            "content": strip_wikilinks(b.get("content", "")), "created": meta.get("created", ""),
+            "comments": _letter_comments(meta),
+        })
+    out = sorted(days.values(), key=lambda d: d["date"], reverse=True)
+    for d in out:
+        for side in ("his", "hers"):
+            d[side].sort(key=lambda e: e["created"])
+    return JSONResponse({"days": out, "ai_name": _ai_name()})
 
 
 @mcp.custom_route("/api/anchors", methods=["GET"])
