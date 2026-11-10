@@ -84,6 +84,8 @@ _MEANING_ITEM_MAX = 1000
 _MEANING_LIST_MAX_ITEMS = 20
 _HER_NOTES_MAX_ITEMS = 200
 _HER_NOTE_MAX = 2000
+_COMMENTS_MAX_ITEMS = 500
+_COMMENT_MAX = 2000
 _PLAN_CHANGE_LOG_MAX_ITEMS = 100
 _ANCHOR_LIMIT = 24
 
@@ -1402,6 +1404,16 @@ class BucketManager:
                 if len(existing) >= _HER_NOTES_MAX_ITEMS:
                     raise ValueError(f"每页最多夹 {_HER_NOTES_MAX_ITEMS} 条笔记。")
                 post["her_notes"] = existing + [{"text": text, "at": str(item.get("at") or "")[:40]}]
+        if "comments_append" in kwargs:
+            # 日记页留言: 她和他都能留, 只追加 [{author, text, at}]
+            item = kwargs["comments_append"] or {}
+            text = str(item.get("text") or "").strip()[:_COMMENT_MAX]
+            author = str(item.get("author") or "").strip()[:120]
+            if text and author:
+                existing = [c for c in (post.get("comments") or []) if isinstance(c, dict) and c.get("text")]
+                if len(existing) >= _COMMENTS_MAX_ITEMS:
+                    raise ValueError(f"每封信最多 {_COMMENTS_MAX_ITEMS} 条留言。")
+                post["comments"] = existing + [{"author": author, "text": text, "at": str(item.get("at") or "")[:40]}]
         for provenance_key, limit in (("source_tool", 32), ("grow_batch_id", 64), ("last_merged_by", 32)):
             if provenance_key in kwargs:
                 value = str(kwargs[provenance_key] or "").strip()[:limit]

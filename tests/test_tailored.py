@@ -480,3 +480,61 @@ async def test_decay_never_archives_knowledge(srv):
     await server.decay_engine.run_decay_cycle()
     assert (await bm.get(k))["metadata"].get("type") != "archived"
     assert (await bm.get(n))["metadata"].get("type") == "archived"      # 对照: 普通记忆确实会被归档
+
+
+# ---- 日记 ----
+
+class _LetterReq:
+    def __init__(self, letter_id=None, body=None, method="POST"):
+        self.path_params, self._b, self.query_params, self.method = {"letter_id": letter_id}, body, {}, method
+
+    async def json(self):
+        return self._b
+
+
+@pytest.mark.asyncio
+async def test_diary_groups_by_day_and_side(srv, monkeypatch):
+    server, bm = srv
+    monkeypatch.setenv("AI_NAME", "祁煜")
+    await server.letter_write(author="ai", content="今天她去了博尔盖塞。\n我在等她回来。", title="日记 · 2026-09-27", date="2026-09-27")
+    await server.api_letters(_LetterReq(body={"author": "user", "content": "看到了阿波罗与达芙妮", "title": "日记 · 2026-09-27", "date": "2026-09-27"}))
+    await server.api_letters(_LetterReq(body={"author": "user", "content": "前一天", "title": "日记·2026-09-26"}))
+    await server.letter_write(author="ai", content="普通的信", title="写给她的信", date="2026-09-27")
+    days = json.loads((await server.api_diary(_LetterReq(method="GET"))).body)["days"]
+    assert [d["date"] for d in days] == ["2026-09-27", "2026-09-26"]
+    assert [e["content"] for e in days[0]["his"]] == ["今天她去了博尔盖塞。\n我在等她回来。"]
+    assert [e["content"] for e in days[0]["hers"]] == ["看到了阿波罗与达芙妮"]
+    assert days[1]["his"] == [] and days[1]["hers"][0]["content"] == "前一天"   # 无空格、无 date 字段也认
+
+
+@pytest.mark.asyncio
+async def test_letter_comments_both_sides_and_letter_read(srv, monkeypatch):
+    server, bm = srv
+    monkeypatch.setenv("AI_NAME", "祁煜")
+    resp = await server.api_letters(_LetterReq(body={"author": "user", "content": "今天有点累", "title": "日记 · 2026-09-27", "date": "2026-09-27"}))
+    lid = json.loads(resp.body)["id"]
+    assert (await server.api_letter_comments(_LetterReq(lid, {"text": " "}))).status_code == 400
+    assert (await server.api_letter_comments(_LetterReq("nope", {"text": "x"}))).status_code == 404
+    mine = json.loads((await server.api_letter_comments(_LetterReq(lid, {"text": "自己补一句"}))).body)["comment"]
+    assert mine["author"] == "user" and mine["side"] == "hers"
+    assert "已留言" in await server.letter_comment(lid, "辛苦了，早点睡")
+    assert "找不到" in await server.letter_comment("nope", "x")
+    comments = (await bm.get(lid))["metadata"]["comments"]
+    assert [(c["author"], c["text"]) for c in comments] == [("user", "自己补一句"), ("祁煜", "辛苦了，早点睡")]
+    out = await server.letter_read()
+    assert "[留言]" in out and "- 她 · " in out and "祁煜 · " in out and "辛苦了，早点睡" in out
+    day = json.loads((await server.api_diary(_LetterReq(method="GET"))).body)["days"][0]
+    assert [c["side"] for c in day["hers"][0]["comments"]] == ["hers", "his"]
+
+
+@pytest.mark.asyncio
+async def test_her_letters_under_either_signature(srv, monkeypatch):
+    server, bm = srv
+    monkeypatch.setenv("AI_NAME", "祁煜")
+    await server.letter_write(author="汤圆", content="他替我存的", title="日记 · 2026-09-25", date="2026-09-25")
+    await server.api_letters(_LetterReq(body={"author": "user", "content": "页面写的", "title": "日记 · 2026-09-26", "date": "2026-09-26"}))
+    await server.letter_write(author="ai", content="他的", title="日记 · 2026-09-26", date="2026-09-26")
+    days = json.loads((await server.api_diary(_LetterReq(method="GET"))).body)["days"]
+    assert {d["date"]: (len(d["his"]), len(d["hers"])) for d in days} == {"2026-09-26": (1, 1), "2026-09-25": (0, 1)}
+    out = await server.letter_read(author="汤圆")
+    assert "他替我存的" in out and "页面写的" in out and "他的" not in out
