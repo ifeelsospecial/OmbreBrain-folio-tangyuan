@@ -241,13 +241,14 @@ class EmbeddingEngine:
 
     def list_content_ids(self) -> list[str]:
         """Return current-model rows that contain a real content vector."""
+        # 只在 SQL 里判空, 不把每行几十 KB 的向量 JSON 整库读进 Python(Render 512MB 会被撑爆)
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, model, embedding FROM embeddings").fetchall()
+        rows = conn.execute(
+            "SELECT bucket_id, model FROM embeddings "
+            "WHERE embedding IS NOT NULL AND trim(embedding) NOT IN ('', '[]')"
+        ).fetchall()
         conn.close()
-        return [
-            bucket_id for bucket_id, model, embedding in rows
-            if self._model_matches(model) and str(embedding or "").strip() not in {"", "[]"}
-        ]
+        return [bucket_id for bucket_id, model in rows if self._model_matches(model)]
 
     def list_content_hashes(self) -> dict[str, str]:
         """Return exact-content identities for current-model vectors."""
@@ -295,40 +296,44 @@ class EmbeddingEngine:
         if not query_embedding:
             raise RuntimeError("embedding provider returned an empty query vector")
 
-        # Load all embeddings from SQLite (只取当前模型的向量 — 跨模型不可混算)
-        conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding, model FROM embeddings").fetchall()
-        conn.close()
-
-        if not rows:
-            return []
-
+        # 逐行读、逐行转成 float32 — 不再 fetchall() 整库 JSON + Python float 列表
+        # (1251 条 × 3072 维时那样一次要两三百 MB, Render 512MB 实例会 OOM 重启)。
         ordered_ids = []
         scores: list[float | None] = []
-        vectors = []
+        vectors: list[np.ndarray] = []
         vector_owners = []
         query_dim = len(query_embedding)
-        for bucket_id, emb_json, stored_model in rows:
-            if not self._model_matches(stored_model):
-                continue
-            owner = len(ordered_ids)
-            ordered_ids.append(bucket_id)
-            scores.append(None)
-            try:
-                stored_embedding = json.loads(emb_json)
-                if not isinstance(stored_embedding, list) or not stored_embedding:
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.execute("SELECT bucket_id, embedding, model FROM embeddings")
+            for bucket_id, emb_json, stored_model in cursor:
+                if not self._model_matches(stored_model):
                     continue
-                stored_embedding = [float(value) for value in stored_embedding]
-            except (json.JSONDecodeError, TypeError, ValueError):
-                continue
-            if len(stored_embedding) != query_dim:
-                scores[owner] = 0.0
-                continue
-            vectors.append(stored_embedding)
-            vector_owners.append(owner)
+                owner = len(ordered_ids)
+                ordered_ids.append(bucket_id)
+                scores.append(None)
+                try:
+                    parsed = json.loads(emb_json)
+                    if not isinstance(parsed, list) or not parsed:
+                        continue
+                    stored_embedding = np.asarray(parsed, dtype=np.float32)
+                    del parsed
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue
+                if stored_embedding.ndim != 1 or stored_embedding.shape[0] != query_dim:
+                    scores[owner] = 0.0
+                    continue
+                vectors.append(stored_embedding)
+                vector_owners.append(owner)
+        finally:
+            conn.close()
+
+        if not ordered_ids:
+            return []
 
         if vectors:
             similarities = self._cosine_similarity_batch(query_embedding, vectors)
+            del vectors
             for owner, similarity in zip(vector_owners, similarities):
                 scores[owner] = float(similarity)
 
@@ -357,10 +362,10 @@ class EmbeddingEngine:
     @staticmethod
     def _cosine_similarity_batch(query: list[float], vectors: list[list[float]]) -> "np.ndarray":
         """Calculate equally-sized cosine similarities in one NumPy matrix pass."""
-        query_array = np.asarray(query, dtype=np.float64)
-        matrix = np.asarray(vectors, dtype=np.float64)
-        dots = matrix @ query_array
-        denominator = np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_array)
+        query_array = np.asarray(query, dtype=np.float32)
+        matrix = np.asarray(vectors, dtype=np.float32)
+        dots = (matrix @ query_array).astype(np.float64)
+        denominator = (np.linalg.norm(matrix, axis=1) * np.linalg.norm(query_array)).astype(np.float64)
         return np.divide(
             dots,
             denominator,
