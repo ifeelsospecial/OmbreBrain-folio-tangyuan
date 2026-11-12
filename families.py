@@ -93,19 +93,19 @@ class FamilyManager:
     # ---------- 重建 ----------
     def _load_vectors(self, ids: list) -> dict:
         """从 embedding 库读当前模型的向量; 返回 {bucket_id: np.array}。"""
+        # 逐行读, 只解析要的那些 — 不 fetchall() 整库向量 JSON(内存会爆)
         out = {}
+        want = set(ids)
         conn = sqlite3.connect(self.engine.db_path)
         try:
-            rows = conn.execute("SELECT bucket_id, embedding, model FROM embeddings").fetchall()
+            for bid, emb, model in conn.execute("SELECT bucket_id, embedding, model FROM embeddings"):
+                if bid in want and self.engine._model_matches(model or ""):
+                    try:
+                        out[bid] = np.array(json.loads(emb), dtype=np.float32)
+                    except Exception:
+                        continue
         finally:
             conn.close()
-        want = set(ids)
-        for bid, emb, model in rows:
-            if bid in want and self.engine._model_matches(model or ""):
-                try:
-                    out[bid] = np.array(json.loads(emb), dtype=np.float32)
-                except Exception:
-                    continue
         return out
 
     @staticmethod
